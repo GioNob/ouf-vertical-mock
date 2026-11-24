@@ -1,0 +1,235 @@
+{
+  "schema": "ouf.vertical-mock-domain.v1",
+  "collections": [
+    {
+      "collection": "edicole",
+      "title": "Edicole (dati fittizi)",
+      "idPrefix": "E-",
+      "delta": {
+        "modes": [
+          "CURSOR",
+          "WATERMARK",
+          "SNAPSHOT"
+        ],
+        "defaultMode": "CURSOR",
+        "deletions": "EXPLICIT"
+      },
+      "generation": {
+        "count": 5,
+        "create": 50,
+        "update": 40,
+        "delete": 10,
+        "duplicate": 0,
+        "late": 0,
+        "maxLateness": "PT10M"
+      },
+      "geometry": {
+        "field": "geometria",
+        "type": "Point",
+        "crs": "EPSG:4326",
+        "bbox": [
+          12,
+          45,
+          12.09,
+          45.09
+        ]
+      },
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "description": "Identificativo naturale",
+          "nullable": false,
+          "generator": {
+            "kind": "id"
+          }
+        },
+        {
+          "name": "indirizzo",
+          "type": "string",
+          "description": "Via e numero civico",
+          "nullable": false,
+          "generator": {
+            "kind": "template",
+            "pattern": "{choice:Via delle Lanterne|Via dei Gelsi} {int:1..120}",
+            "varies": "OBJECT"
+          }
+        },
+        {
+          "name": "cap",
+          "type": "string",
+          "description": "Codice postale dimostrativo",
+          "nullable": false,
+          "generator": {
+            "kind": "choice",
+            "values": [
+              "00000",
+              "00001"
+            ]
+          }
+        },
+        {
+          "name": "localita",
+          "type": "string",
+          "description": "Località fittizia",
+          "nullable": false,
+          "generator": {
+            "kind": "choice",
+            "values": [
+              "Borgo delle Lanterne"
+            ]
+          }
+        },
+        {
+          "name": "tipologia",
+          "type": "string",
+          "description": "Tipo di rivendita",
+          "nullable": false,
+          "generator": {
+            "kind": "choice",
+            "values": [
+              "chiosco",
+              "negozio"
+            ]
+          }
+        },
+        {
+          "name": "servizi",
+          "type": "string",
+          "description": "Servizi disponibili",
+          "nullable": false,
+          "generator": {
+            "kind": "choice",
+            "values": [
+              "quotidiani",
+              "riviste e cartoleria"
+            ],
+            "varies": "REVISION"
+          }
+        },
+        {
+          "name": "telefono",
+          "type": "string",
+          "description": "Recapito dimostrativo",
+          "nullable": false,
+          "generator": {
+            "kind": "template",
+            "pattern": "DEMO-{int:1000..9999}"
+          }
+        },
+        {
+          "name": "data_apertura",
+          "type": "date",
+          "description": "Data di apertura",
+          "nullable": false,
+          "generator": {
+            "kind": "date",
+            "from": "2000-01-01",
+            "to": "2024-12-31"
+          }
+        },
+        {
+          "name": "geometria",
+          "type": "geometry",
+          "description": "Geometria dimostrativa",
+          "nullable": false,
+          "generator": {
+            "kind": "point",
+            "varies": "OBJECT"
+          }
+        }
+      ]
+    },
+    {
+      "collection": "cantieri",
+      "title": "Cantieri (dati fittizi)",
+      "idPrefix": "C-",
+      "delta": {
+        "modes": [
+          "SNAPSHOT",
+          "WATERMARK"
+        ],
+        "defaultMode": "SNAPSHOT",
+        "deletions": "SNAPSHOT_ABSENCE"
+      },
+      "generation": {
+        "count": 5,
+        "create": 50,
+        "update": 40,
+        "delete": 10,
+        "duplicate": 0,
+        "late": 0,
+        "maxLateness": "PT10M"
+      },
+      "geometry": {
+        "field": "geometria",
+        "type": "Polygon",
+        "crs": "EPSG:4326",
+        "bbox": [
+          12,
+          45,
+          12.09,
+          45.09
+        ]
+      },
+      "fields": [
+        {
+          "name": "id",
+          "type": "string",
+          "description": "Identificativo naturale",
+          "nullable": false,
+          "generator": {
+            "kind": "id"
+          }
+        },
+        {
+          "name": "intervento",
+          "type": "string",
+          "description": "Tipo di intervento",
+          "nullable": false,
+          "generator": {
+            "kind": "choice",
+            "values": [
+              "Posa di condotte",
+              "Manutenzione del verde"
+            ],
+            "varies": "REVISION"
+          }
+        },
+        {
+          "name": "data_inizio",
+          "type": "date",
+          "description": "Inizio lavori",
+          "nullable": false,
+          "generator": {
+            "kind": "date",
+            "from": "2025-01-01",
+            "to": "2025-12-31"
+          }
+        },
+        {
+          "name": "data_fine",
+          "type": "date",
+          "description": "Fine prevista",
+          "nullable": false,
+          "generator": {
+            "kind": "date",
+            "after": "data_inizio",
+            "minDays": 10,
+            "maxDays": 90
+          }
+        },
+        {
+          "name": "geometria",
+          "type": "geometry",
+          "description": "Geometria dimostrativa",
+          "nullable": false,
+          "generator": {
+            "kind": "polygon",
+            "varies": "OBJECT"
+          }
+        }
+      ]
+    }
+  ]
+}

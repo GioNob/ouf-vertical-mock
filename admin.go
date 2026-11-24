@@ -3,175 +3,238 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
-	"strconv"
+	"os"
+	"slices"
 	"time"
 )
 
-func payload(raw []byte, dest any) bool {
-	b := bytes.TrimSpace(raw)
-	if len(b) == 0 || b[0] != '{' {
-		return false
-	}
-	d := json.NewDecoder(bytes.NewReader(b))
-	d.DisallowUnknownFields()
-	return d.Decode(dest) == nil && d.Decode(new(any)) == io.EOF
+func payload(b []byte, v any) bool {
+	raw := bytes.TrimSpace(b)
+	return len(raw) > 0 && raw[0] == '{' && strictJSON(raw, v) == nil
 }
 
 type rateEdit struct {
-	Count     *int    `json:"count"`
-	Interval  *string `json:"interval"`
-	Create    *int    `json:"create"`
-	Update    *int    `json:"update"`
-	Delete    *int    `json:"delete"`
-	ReadDelay *string `json:"readDelay"`
+	Collection  string  `json:"collection"`
+	Count       *int    `json:"count"`
+	Create      *int    `json:"create"`
+	Update      *int    `json:"update"`
+	Delete      *int    `json:"delete"`
+	Duplicate   *int    `json:"duplicate"`
+	Late        *int    `json:"late"`
+	MaxLateness *string `json:"maxLateness"`
+	Cycle       *string `json:"cycle"`
 }
 
-func (r rateEdit) merge(current rate) (rate, bool) {
-	for _, p := range []struct{ dst, src *int }{
-		{&current.Count, r.Count}, {&current.Create, r.Create}, {&current.Update, r.Update}, {&current.Delete, r.Delete},
-	} {
-		if p.src != nil {
-			*p.dst = *p.src
-		}
+func (s *store) setRate(tx *transaction, raw []byte) *problem {
+	var e rateEdit
+	if !payload(raw, &e) {
+		return invalid
 	}
-	for _, p := range []struct {
-		dst *time.Duration
-		src *string
-	}{{&current.Interval, r.Interval}, {&current.ReadDelay, r.ReadDelay}} {
-		if p.src != nil {
-			v, err := time.ParseDuration(*p.src)
-			if err != nil {
-				return current, false
+	if e.Cycle != nil {
+		d, err := duration(*e.Cycle)
+		if err != nil || d < time.Second {
+			return invalid
+		}
+		tx.Cycle = &d
+	}
+	tx.Rates = map[string]rate{}
+	for name, c := range s.Collections {
+		if e.Collection != "" && e.Collection != name {
+			continue
+		}
+		r := c.Rate
+		for _, pair := range [][2]*int{{&r.Count, e.Count}, {&r.Create, e.Create}, {&r.Update, e.Update}, {&r.Delete, e.Delete}, {&r.Duplicate, e.Duplicate}, {&r.Late, e.Late}} {
+			if pair[1] != nil {
+				*pair[0] = *pair[1]
 			}
-			*p.dst = v
+		}
+		if e.MaxLateness != nil {
+			r.MaxLateness = *e.MaxLateness
+		}
+		if r.validate(s.cfg.MaxLate) != nil {
+			return invalid
+		}
+		d, _ := duration(r.MaxLateness)
+		for _, p := range s.Pending {
+			if p.Collection == name && p.Due.Sub(p.ChangedAt) > d {
+				return &problem{409, "TARGET_NOT_AVAILABLE"}
+			}
+		}
+		tx.Rates[name] = r
+	}
+	return nil
+}
+
+func (s *store) status() object {
+	rates, retained, pending := map[string]rate{}, object{}, map[string]int{}
+	for name, c := range s.Collections {
+		rates[name], retained[name], pending[name] = c.Rate, c.RetainedFrom, 0
+	}
+	for _, e := range s.Pending {
+		pending[e.Collection]++
+	}
+	activeOutages := map[string]outage{}
+	for name, o := range s.Outages {
+		if s.now().Before(o.Until) {
+			activeOutages[name] = o
 		}
 	}
-	return current, current.valid()
+	var fileHash any
+	if b, err := os.ReadFile(s.cfg.DomainFile); err == nil {
+		fileHash = hashBytes(b)
+	}
+	return object{"schemaVersion": s.catalogVersion(), "journalFormat": s.Format, "domainFileSha256": fileHash, "journalDomainSha256": s.DomainHash,
+		"generation": rates, "pending": len(s.Pending), "pendingByCollection": pending, "outages": activeOutages, "head": s.head(), "floor": s.Floor,
+		"retainedFrom": retained, "clockOffset": iso(s.Offset), "cycle": iso(s.Cycle), "retention": iso(s.cfg.Retention), "maxLateness": iso(s.cfg.MaxLate),
+		"readMinInterval": iso(s.cfg.ReadInterval), "clockControl": s.cfg.ClockControl, "port": s.cfg.Port, "seed": s.Seed, "dataDir": s.cfg.Dir, "domainFile": s.cfg.DomainFile}
 }
 
-func (s *store) expected(events []record) []object {
-	out := make([]object, 0, len(events))
-	for _, e := range events {
-		it := render(s.Seed, e, s.Collections[e.Collection].Versions[e.Version])
-		out = append(out, object{"sequence": e.Seq, "recordedAt": e.RecordedAt, "collection": e.Collection, "schemaVersion": e.Version, "item": it})
-	}
-	return out
-}
-
-func (s *store) admin(r *http.Request, path []string, raw []byte) (any, string, *problem) {
-	v := s.catalogVersion()
-	if len(path) != 2 {
-		return nil, v, &problem{404, "NOT_FOUND"}
-	}
-	if path[1] == "expected" {
+func (s *store) admin(r *http.Request, raw []byte, name string) (any, *problem) {
+	path := r.URL.Path
+	if path == "/admin/status" || path == "/admin/expected" || path == "/admin/expected/state" {
 		if r.Method != "GET" {
-			return nil, v, &problem{405, "METHOD_NOT_ALLOWED"}
+			return nil, badMethod
 		}
-		since := s.Floor
-		if value := r.URL.Query().Get("since"); value != "" {
-			var err error
-			since, err = strconv.ParseInt(value, 10, 64)
-			if err != nil || since < 0 || since > s.head() {
-				return nil, v, badPosition
+		if path == "/admin/status" {
+			if name != "" {
+				return nil, badPosition
 			}
-			if since < s.Floor {
-				return nil, v, expired
-			}
+			return s.status(), nil
 		}
-		return object{"schemaVersion": v, "expected": s.expected(s.history[since-s.Floor:]), "nextSince": s.head()}, v, nil
+		return s.ledger(r.URL.Query(), name, path == "/admin/expected/state")
+	}
+	if path == "/admin/clock" && !s.cfg.ClockControl {
+		return nil, notFound
 	}
 	if r.Method != "POST" {
-		return nil, v, &problem{405, "METHOD_NOT_ALLOWED"}
+		return nil, badMethod
 	}
-	invalid := &problem{400, "INVALID_COMMAND"}
 	var tx transaction
-	var collectionName string
-	switch path[1] {
-	case "rate":
-		var e rateEdit
-		if !payload(raw, &e) {
-			return nil, v, invalid
+	reply := object{}
+	switch path {
+	case "/admin/rate":
+		if prob := s.setRate(&tx, raw); prob != nil {
+			return nil, prob
 		}
-		next, ok := e.merge(s.Rate)
-		if !ok {
-			return nil, v, invalid
-		}
-		tx.Rate = &next
-	case "outage":
+	case "/admin/outage":
 		var e struct {
-			Duration string `json:"duration"`
+			Collection, Kind, Duration string
+			RetryAfter                 json.RawMessage
 		}
-		if !payload(raw, &e) {
-			return nil, v, invalid
+		if !payload(raw, &e) || (e.Kind != "RATE_LIMITED" && e.Kind != "UNAVAILABLE") {
+			return nil, invalid
 		}
-		duration, err := time.ParseDuration(e.Duration)
-		if err != nil || duration < 0 {
-			return nil, v, invalid
-		}
-		until := s.now().UTC().Add(duration)
-		tx.Outage = &until
-	case "inject":
-		e := injection{Count: 1}
-		if !payload(raw, &e) || s.Collections[e.Collection] == nil {
-			return nil, v, invalid
-		}
-		collectionName, v = e.Collection, s.Collections[e.Collection].Active
-		if e.Count < 1 || e.Count > 10000 || (e.Kind != "duplicate" && e.Kind != "late" && e.Kind != "delete") ||
-			(e.Kind == "late" && (e.Minutes <= 0 || int64(e.Minutes) > int64(s.cfg.Retention/time.Minute))) {
-			return nil, v, invalid
-		}
-		var err error
-		tx.Events, err = s.plan(e.Collection, s.head()+1, s.now().UTC(), e)
+		d, err := duration(e.Duration)
 		if err != nil {
-			return nil, v, &problem{409, "NO_LIVE_TARGET"}
+			return nil, invalid
 		}
-	case "schema":
+		o := outage{Collection: name, Kind: e.Kind, Until: s.now().Add(d)}
+		if e.RetryAfter != nil {
+			var interval string
+			if json.Unmarshal(e.RetryAfter, &interval) == nil {
+				d, err := duration(interval)
+				if err != nil || d == 0 {
+					return nil, invalid
+				}
+				o.RetryAfter = seconds(d)
+			} else if json.Unmarshal(e.RetryAfter, &o.RetryAfter) != nil || o.RetryAfter < 1 {
+				return nil, invalid
+			}
+		}
+		tx.Outage = &o
+	case "/admin/inject":
+		e := injection{Count: 1}
+		if !payload(raw, &e) || name == "" || e.Count < 1 || e.Count > 10000 ||
+			!slices.Contains([]string{"create", "update", "delete", "late", "duplicate"}, e.Kind) {
+			return nil, invalid
+		}
+		limit, _ := duration(s.Collections[name].Rate.MaxLateness)
+		if e.Kind == "late" {
+			if e.Lateness == "" {
+				e.Lateness = iso(limit)
+			}
+			d, err := duration(e.Lateness)
+			if err != nil || d < time.Second || d > limit {
+				return nil, invalid
+			}
+		} else if e.Lateness != "" {
+			return nil, invalid
+		}
+		if err := s.plan(&tx, e, s.now()); err != nil {
+			return nil, &problem{409, "TARGET_NOT_AVAILABLE"}
+		}
+	case "/admin/schema":
 		var e schemaEdit
-		if !payload(raw, &e) || s.Collections[e.Collection] == nil {
-			return nil, v, invalid
+		if !payload(raw, &e) || name == "" {
+			return nil, invalid
 		}
-		c := s.Collections[e.Collection]
-		collectionName, v = e.Collection, c.Active
-		var next schema
+		c := s.Collections[name]
+		next, ok := c.Versions[e.Version]
 		if e.Action == "revert" {
-			var ok bool
-			if next, ok = c.Versions[e.Version]; !ok {
-				return nil, v, invalid
+			if !ok {
+				return nil, &problem{400, "UNKNOWN_SCHEMA_VERSION"}
 			}
 		} else {
 			var err error
 			next, err = editSchema(c.Versions[c.Active], e)
 			if err != nil {
-				return nil, v, invalid
+				return nil, invalid
 			}
 		}
-		tx.Collection, tx.Schema = e.Collection, &next
-	case "reset":
-		if len(raw) > 0 && !payload(raw, &struct{}{}) {
-			return nil, v, invalid
+		tx.Collection, tx.Schema = name, &next
+		reply["previousSchemaVersion"], reply["fieldsSha256"] = c.Active, digest(next.Fields)
+	case "/admin/clock":
+		var e struct{ Advance string }
+		if !payload(raw, &e) {
+			return nil, invalid
 		}
-		if err := s.reset(); err != nil {
-			return nil, v, unavailable
+		d, err := duration(e.Advance)
+		effective := s.now().Sub(s.at)
+		if err != nil || d <= 0 || d > 1<<63-1-effective {
+			return nil, invalid
+		}
+		offset := effective + d
+		tx.Offset = &offset
+		s.release(&tx, s.now().Add(d))
+	case "/admin/reset":
+		var e struct{ ReloadDomain bool }
+		if len(raw) != 0 && !payload(raw, &e) {
+			return nil, invalid
+		}
+		d := s.Domain
+		if e.ReloadDomain {
+			var err error
+			d, err = loadDomain(s.cfg.DomainFile, s.cfg.MaxLate)
+			if err != nil {
+				return nil, invalid
+			}
+		}
+		if err := s.reset(d); err != nil {
+			return nil, unavailable
 		}
 	default:
-		return nil, v, &problem{404, "NOT_FOUND"}
+		return nil, notFound
 	}
-	if path[1] != "reset" {
+	if path != "/admin/reset" {
 		if err := s.commit(tx); err != nil {
-			return nil, v, unavailable
+			return nil, unavailable
 		}
 	}
-	if path[1] == "reset" || path[1] == "rate" {
+	if tx.Offset != nil && s.compact() != nil {
+		return nil, unavailable
+	}
+	if tx.Cycle != nil || path == "/admin/reset" {
 		select {
 		case s.reschedule <- struct{}{}:
 		default:
 		}
 	}
-	v = s.catalogVersion()
-	if collectionName != "" {
-		v = s.Collections[collectionName].Active
+	reply["schemaVersion"], reply["nextSince"] = s.version(name), s.head()
+	rows := make([]object, 0, len(tx.Events))
+	for _, e := range tx.Events {
+		rows = append(rows, s.row(e, e.Version))
 	}
-	return object{"schemaVersion": v, "expected": s.expected(tx.Events), "nextSince": s.head()}, v, nil
+	reply["rows"] = rows
+	return reply, nil
 }

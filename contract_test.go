@@ -1,7 +1,7 @@
 package main
 
 import (
-	"context"
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"net/http/httptest"
@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,21 +27,34 @@ type lab struct {
 func newLab(t *testing.T) *lab {
 	t.Helper()
 	l := &lab{T: t, clock: time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)}
-	c := config{Dir: t.TempDir(), Retention: 7*24*time.Hour, RetentionText: "P7D", Collections: []string{"edicole", "cantieri"},
-		Seed: 73, Rate: rate{Count: 3, Interval: time.Minute, Create: 100}, ReadToken: sha256.Sum256([]byte("reader")), AdminToken: sha256.Sum256([]byte("admin"))}
-	var err error
+	d, err := os.ReadFile("examples/domain-lab.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := config{Dir: t.TempDir(), Retention: 7 * 24 * time.Hour, Cycle: time.Minute, MaxLate: 10 * time.Minute, ClockControl: true, Seed: 73,
+		ReadToken: sha256.Sum256([]byte("reader")), AdminToken: sha256.Sum256([]byte("admin"))}
+	c.DomainFile = filepath.Join(t.TempDir(), "domain.json")
+	if err := os.WriteFile(c.DomainFile, d, 0600); err != nil {
+		t.Fatal(err)
+	}
 	l.store, err = openStore(c, func() time.Time { return l.clock })
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { l.lock.Close() })
 	return l
 }
 
-func (l *lab) tick() {
+func (l *lab) restart() {
 	l.Helper()
-	if err := l.cycle(); err != nil {
+	if err := l.lock.Close(); err != nil {
 		l.Fatal(err)
 	}
+	s, err := openStore(l.cfg, func() time.Time { return l.clock })
+	if err != nil {
+		l.Fatal(err)
+	}
+	l.store = s
 }
 
 func (l *lab) request(method, path, body, token string, status int) *httptest.ResponseRecorder {
@@ -51,377 +65,414 @@ func (l *lab) request(method, path, body, token string, status int) *httptest.Re
 	}
 	w := httptest.NewRecorder()
 	l.ServeHTTP(w, r)
-	if w.Code != status || w.Header().Get("X-Schema-Version") == "" {
-		l.Fatalf("%s %s: status %d, body %s", method, path, w.Code, w.Body.String())
+	if w.Code != status {
+		l.Fatalf("%s %s: want %d, got %d: %s", method, path, status, w.Code, w.Body.String())
 	}
-	if w.Body.Len() > 0 {
-		var v struct {
-			Version string `json:"schemaVersion"`
+	header := w.Header().Get("X-Schema-Version")
+	if strings.HasPrefix(path, "/health/") {
+		if header != "" || w.Body.Len() != 0 {
+			l.Fatal("probe leaked schema or body")
 		}
-		if json.Unmarshal(w.Body.Bytes(), &v) != nil || v.Version != w.Header().Get("X-Schema-Version") {
-			l.Fatalf("schemaVersion missing or inconsistent in %s", w.Body.String())
+	} else if status == 401 {
+		if header != "" || w.Body.String() != `{"code":"UNAUTHENTICATED"}` || w.Header().Get("WWW-Authenticate") != "Bearer" {
+			l.Fatal("unexpected authentication response")
+		}
+	} else {
+		var b struct{ SchemaVersion string }
+		if json.Unmarshal(w.Body.Bytes(), &b) != nil || len(header) != 64 || b.SchemaVersion != header {
+			l.Fatalf("schema mismatch: %s", w.Body.String())
 		}
 	}
 	return w
 }
 
-func (l *lab) readPage(path string) envelope {
-	l.Helper()
-	w := l.request("GET", path, "", "reader", 200)
-	var e envelope
-	if err := json.Unmarshal(w.Body.Bytes(), &e); err != nil {
-		l.Fatal(err)
+func decode[T any](t *testing.T, w *httptest.ResponseRecorder) T {
+	t.Helper()
+	var v T
+	if err := json.Unmarshal(w.Body.Bytes(), &v); err != nil {
+		t.Fatal(err)
 	}
-	return e
+	return v
+}
+
+type ledgerRow struct {
+	Sequence                                    int64
+	RecordedAt                                  time.Time
+	Collection, Origin, Kind                    string
+	Lateness, DeleteVisibility                  *string
+	EmittedSchemaVersion, RenderedSchemaVersion string
+	Item                                        item
+	ContentSha256                               string
 }
 
 type receipt struct {
-	Version  string `json:"schemaVersion"`
-	Expected []struct {
-		Sequence int64 `json:"sequence"`
-		Item item `json:"item"`
-	} `json:"expected"`
-	NextSince int64 `json:"nextSince"`
+	SchemaVersion, PreviousSchemaVersion, FieldsSha256 string
+	Rows                                               []ledgerRow
+	NextSince                                          int64
+	HasMore                                            bool
 }
 
 func (l *lab) command(path, body string) receipt {
 	l.Helper()
-	w := l.request("POST", "/admin/"+path, body, "admin", 200)
-	var result receipt
-	if err := json.Unmarshal(w.Body.Bytes(), &result); err != nil || result.Expected == nil {
-		l.Fatalf("invalid receipt: %s", w.Body.String())
-	}
-	return result
+	return decode[receipt](l.T, l.request("POST", "/admin/"+path, body, "admin", 200))
 }
 
-func (l *lab) restart() {
+func (l *lab) inject(collection, kind, id string) receipt {
 	l.Helper()
-	reopened, err := openStore(l.cfg, func() time.Time { return l.clock })
-	if err != nil {
-		l.Fatal(err)
-	}
-	l.store = reopened
+	b, _ := json.Marshal(object{"collection": collection, "kind": kind, "id": id})
+	return l.command("inject", string(b))
 }
 
-func (l *lab) collect(path, mode string, limit int) ([]item, envelope) {
+func (l *lab) page(path string) envelope {
 	l.Helper()
-	p := l.readPage(path)
-	var all []item
-	for pages := 0; ; pages++ {
-		if pages > 50 || p.Mode != mode || len(p.Items) > limit || p.Items == nil {
-			l.Fatalf("invalid page: %+v", p)
-		}
-		if mode == "SNAPSHOT" {
-			if p.SnapshotComplete == nil || *p.SnapshotComplete == p.HasMore {
-				l.Fatal("invalid snapshotComplete")
-			}
-		} else if p.SnapshotComplete != nil {
-			l.Fatal("unexpected snapshotComplete")
-		}
-		all = append(all, p.Items...)
-		if !p.HasMore {
-			return all, p
-		}
-		if p.Next == nil {
-			l.Fatal("missing next")
-		}
-		key := "cursor"
-		if mode == "SNAPSHOT" {
-			key = "page"
-		}
-		p = l.readPage(path+"&"+key+"="+url.QueryEscape(*p.Next))
-	}
+	return decode[envelope](l.T, l.request("GET", path, "", "reader", 200))
 }
 
-func TestModesOrderingLateDuplicatesAndDelete(t *testing.T) {
+func (l *lab) expected(query string) receipt {
+	l.Helper()
+	return decode[receipt](l.T, l.request("GET", "/admin/expected?"+query, "", "admin", 200))
+}
+
+func TestSnapshotResumeAndRestart(t *testing.T) {
 	l := newLab(t)
-	l.tick()
-	initial := l.readPage(itemsURL)
-	target := initial.Items[0]
+	l.inject("edicole", "create", "A")
+	l.command("inject", `{"collection":"edicole","kind":"late","id":"A","lateness":"PT3M"}`)
 	l.clock = l.clock.Add(time.Minute)
-	dup := l.command("inject", `{"collection":"edicole","kind":"duplicate","id":"`+target.ID+`"}`)
-	if !reflect.DeepEqual(dup.Expected[0].Item, target) {
-		t.Fatal("duplicate changed data")
-	}
-	late := l.command("inject", `{"collection":"edicole","kind":"late","minutes":5,"id":"`+target.ID+`"}`).Expected[0].Item
-	if late.Revision != target.Revision+1 || !late.ChangedAt.Before(l.clock) {
-		t.Fatal("late revision or timestamp")
-	}
-	deleted := l.command("inject", `{"collection":"edicole","kind":"delete","id":"`+target.ID+`"}`).Expected[0].Item
-	if deleted.Op != "DELETE" || deleted.Properties != nil || deleted.Revision != late.Revision+1 {
-		t.Fatal("invalid tombstone")
-	}
-	events, tail := l.collect(itemsURL+"?limit=1", "CURSOR", 1)
-	water, _ := l.collect(itemsURL+"?mode=WATERMARK&limit=1", "WATERMARK", 1)
-	if len(events) != 6 || !reflect.DeepEqual(water, events) || tail.Next == nil {
-		t.Fatal("lost delta or checkpoint")
-	}
-	for i := 1; i < len(events); i++ {
-		prev, next := events[i-1], events[i]
-		if prev.ChangedAt.After(next.ChangedAt) || (prev.ChangedAt.Equal(next.ChangedAt) &&
-			(prev.ID > next.ID || (prev.ID == next.ID && prev.Revision > next.Revision))) {
-			t.Fatal("unstable delta order")
-		}
-	}
-	snap, last := l.collect(itemsURL+"?mode=SNAPSHOT&limit=1", "SNAPSHOT", 1)
-	if len(snap) != 2 || last.Next != nil || slices.ContainsFunc(snap, func(i item) bool { return i.ID == target.ID }) {
-		t.Fatal("deleted item still present")
-	}
-	remain := l.readPage(itemsURL+"?mode=WATERMARK&changedSince="+url.QueryEscape(target.ChangedAt.Format(time.RFC3339Nano))+"&afterId="+target.ID)
-	if len(remain.Items) != 3 || remain.Items[0].ID <= target.ID {
-		t.Fatal("watermark tie breaker")
-	}
-	w := l.request("GET", "/admin/expected?since=6", "", "admin", 200)
-	var ledger receipt
-	if err := json.Unmarshal(w.Body.Bytes(), &ledger); err != nil || ledger.NextSince != 9 || len(ledger.Expected) != 3 ||
-		ledger.Expected[2].Sequence != 9 || !reflect.DeepEqual(ledger.Expected[2].Item, deleted) {
-		t.Fatal("expected log disagrees with the API")
-	}
-}
-
-func TestFrozenSnapshotAndCursorReplayAfterRestart(t *testing.T) {
-	l := newLab(t)
-	l.tick()
-	p := l.readPage(itemsURL+"?mode=SNAPSHOT&limit=1")
-	current := l.readPage(itemsURL)
-	lastID := current.Items[2].ID
-	l.command("inject", `{"collection":"edicole","kind":"delete","id":"`+lastID+`"}`)
-	remaining := l.readPage(itemsURL+"?mode=SNAPSHOT&page="+*p.Next)
-	if len(remaining.Items) != 2 || remaining.Items[1].ID != lastID || !*remaining.SnapshotComplete {
-		t.Fatal("snapshot moved")
-	}
-	poll := itemsURL+"?cursor="+*current.Next
-	before := l.readPage(poll)
-	l.clock = l.clock.Add(time.Minute)
-	l.command("inject", `{"collection":"edicole","kind":"late","minutes":4}`)
+	l.inject("edicole", "create", "B")
+	p := l.page(itemsURL + "?mode=SNAPSHOT&limit=1")
 	l.restart()
-	replay := l.readPage(poll)
-	if !reflect.DeepEqual(before, replay) || len(replay.Items) != 1 || replay.Items[0].ID != lastID {
-		t.Fatal("replay changed")
+	l.command("clock", `{"advance":"PT3M"}`)
+	end := l.page(itemsURL + "?mode=SNAPSHOT&page=" + *p.Next)
+	if p.Items[0].ID != "A" || p.Items[0].Revision != 1 || end.Items[0].ID != "B" ||
+		*p.SnapshotID != *end.SnapshotID || *p.SnapshotComplete || !*end.SnapshotComplete || p.Resume != nil || end.Resume == nil {
+		t.Fatal("snapshot moved across a delayed arrival")
 	}
-	late := l.readPage(itemsURL+"?cursor="+*before.Next)
-	if len(late.Items) != 1 || !late.Items[0].ChangedAt.Before(l.clock) {
-		t.Fatal("cursor missed arrival behind the temporal watermark")
+	if !end.Resume.SnapshotAt.Equal(l.clock) || len(end.Resume.Watermark) != 1 || end.Resume.Watermark["changedSince"] != l.clock.Add(-10*time.Minute).Format(time.RFC3339Nano) {
+		t.Fatal("unsafe watermark resume point")
 	}
-}
-
-type descriptor struct {
-	Version     string  `json:"schemaVersion"`
-	Fields      []field `json:"fields"`
-	Fingerprint string  `json:"fieldsFingerprint"`
-}
-
-func TestSchemaEvolutionRevertAndProjection(t *testing.T) {
-	l := newLab(t)
-	l.tick()
-	describe := func() descriptor {
-		var d descriptor
-		w := l.request("GET", "/collections/edicole/schema", "", "reader", 200)
-		if err := json.Unmarshal(w.Body.Bytes(), &d); err != nil || digest(d.Fields) != d.Fingerprint {
-			t.Fatalf("invalid descriptor: %s", w.Body.String())
-		}
-		return d
+	poll := itemsURL + "?cursor=" + end.Resume.Cursor
+	delta := l.page(poll)
+	if len(delta.Items) != 1 || delta.Items[0].ID != "A" || delta.Items[0].Revision != 2 || delta.Next == nil {
+		t.Fatal("cursor must contain exactly A revision 2")
 	}
-	original := describe()
-	last := original
-	for _, edit := range []string{
-		`"action":"add","name":"posti","type":"integer","description":"Posti disponibili"`,
-		`"action":"rename","name":"posti","newName":"capienza"`,
-		`"action":"type","name":"capienza","type":"boolean"`,
-		`"action":"remove","name":"telefono"`,
-	} {
-		result := l.command("schema", `{"collection":"edicole",`+edit+`}`)
-		d := describe()
-		if d.Version == last.Version || d.Fingerprint == last.Fingerprint || result.Version != d.Version {
-			t.Fatal("schema or fingerprint did not change")
-		}
-		l.tick()
-		p := l.readPage(itemsURL)
-		for _, it := range p.Items {
-			if p.Version != d.Version || len(it.Properties) != len(d.Fields) {
-				t.Fatal("incoherent schema envelope")
-			}
-			for _, f := range d.Fields {
-				v := it.Properties[f.Name]
-				if v == nil || (f.Type == "boolean" && reflect.TypeOf(v).Kind() != reflect.Bool) ||
-					(f.Type == "integer" && reflect.TypeOf(v).Kind() != reflect.Float64) {
-					t.Fatalf("wrong property %s: %v", f.Name, v)
-				}
-			}
-		}
-		last = d
-	}
-	l.restart()
-	l.command("schema", `{"collection":"edicole","action":"revert","version":"`+original.Version+`"}`)
-	if !reflect.DeepEqual(describe(), original) || l.readPage(itemsURL).Version != original.Version {
-		t.Fatal("revert failed")
-	}
-	if digest([]field{{"Caffè", "id", false, "string"}}) != "9d6a480a969b79b83dc6398f197b32c3c9dffa10e8cdd82dd34fa250fa632610" {
-		t.Fatal("canonical UTF-8 fingerprint")
-	}
-}
-
-func TestGeneratedCollectionsAndSeed(t *testing.T) {
-	a, b := newLab(t), newLab(t)
-	for _, l := range []*lab{a, b} {
-		l.tick()
-		l.command("rate", `{"create":0,"update":100,"delete":0}`)
-		l.tick()
-		l.command("rate", `{"create":0,"update":0,"delete":100}`)
-		l.tick()
-	}
-	for _, name := range []string{"cantieri", "edicole"} {
-		path := "/collections/"+name+"/items"
-		first, second := a.readPage(path), b.readPage(path)
-		if !reflect.DeepEqual(first.Items, second.Items) || len(first.Items) != 9 {
-			t.Fatal("seed or operation count")
-		}
-		if len(a.readPage(path+"?mode=SNAPSHOT").Items) != 0 {
-			t.Fatal("delete rate did not empty collection")
-		}
-		for _, it := range first.Items {
-			if it.Op == "DELETE" {
-				continue
-			}
-			props := it.Properties
-			if props["id"] != it.ID {
-				t.Fatal("natural key")
-			}
-			g := props["geometria"].(map[string]any)
-			if name == "cantieri" {
-				ring := g["coordinates"].([]any)[0].([]any)
-				if g["type"] != "Polygon" || len(ring) < 4 || !reflect.DeepEqual(ring[0], ring[len(ring)-1]) ||
-					props["data_inizio"].(string) >= props["data_fine"].(string) {
-					t.Fatal("invalid construction site")
-				}
-			} else if g["type"] != "Point" || len(g["coordinates"].([]any)) != 2 || len(props) != 9 {
-				t.Fatal("invalid newsstand")
-			}
-		}
-	}
-}
-
-func TestConfigAndScheduler(t *testing.T) {
-	dir := t.TempDir()
-	// Set every configurable option to isolate the test from operator settings.
-	for k, v := range map[string]string{
-		"PORT": "8080", "DATA_DIR": dir, "RETENTION": "P1DT2H3M4S", "SEED": "12",
-		"COLLECTIONS": "cantieri", "COUNT": "1", "INTERVAL": "5ms",
-		"CREATE": "100", "UPDATE": "0", "DELETE": "0", "READ_DELAY": "0s",
-	} {
-		t.Setenv("OUF_"+k, v)
-	}
-	for _, name := range []string{"READ_TOKEN_FILE", "ADMIN_TOKEN_FILE"} {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte("test-"+name+"\r\n"), 0600); err != nil {
-			t.Fatal(err)
-		}
-		t.Setenv("OUF_"+name, path)
-	}
-	c, err := loadConfig()
-	if err != nil || c.Retention != 26*time.Hour+3*time.Minute+4*time.Second {
-		t.Fatalf("config: %+v", err)
-	}
-	s, err := openStore(c, time.Now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		s.schedule(ctx)
-	}()
-	defer func() {
-		cancel()
-		<-done
-	}()
-	deadline := time.Now().Add(3*time.Second)
+	q := url.Values{"mode": {"WATERMARK"}, "changedSince": {end.Resume.Watermark["changedSince"]}, "limit": {"1"}}
+	var water []item
 	for {
-		s.Lock()
-		head := s.head()
-		s.Unlock()
-		if head >= 2 {
+		page := l.page(itemsURL + "?" + q.Encode())
+		water = append(water, page.Items...)
+		if !page.HasMore {
+			if page.Next != nil {
+				t.Fatal("watermark tail")
+			}
 			break
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("scheduler did not generate two cycles")
-		}
-		time.Sleep(5*time.Millisecond)
+		q.Del("changedSince")
+		q.Set("cursor", *page.Next)
 	}
-	t.Setenv("OUF_READ_TOKEN_FILE", "")
-	t.Setenv("OUF_READ_TOKEN", "plain-text-is-ignored")
-	if _, err = loadConfig(); err == nil {
-		t.Fatal("plaintext credential accepted")
+	if !slices.ContainsFunc(water, func(it item) bool { return reflect.DeepEqual(it, delta.Items[0]) }) ||
+		!slices.ContainsFunc(water, func(it item) bool { return it.ID == "B" }) {
+		t.Fatal("watermark failed safe replay")
+	}
+	empty := l.page(itemsURL + "?cursor=" + *delta.Next)
+	l.inject("edicole", "update", "B")
+	l.restart()
+	if replay := l.page(poll); !reflect.DeepEqual(replay.Items, delta.Items) || *replay.Next != *delta.Next {
+		t.Fatal("replayed window changed")
+	}
+	if replay := l.page(itemsURL + "?cursor=" + *delta.Next); len(replay.Items) != 0 || *replay.Next != *empty.Next {
+		t.Fatal("first empty poll was not durably frozen")
+	}
+	if p := l.page(itemsURL + "?cursor=" + *empty.Next); len(p.Items) != 1 || p.Items[0].ID != "B" {
+		t.Fatal("empty successor missed an arrival")
 	}
 }
 
-func TestRetentionCompactionAndTornTail(t *testing.T) {
+func TestModesAndAbsence(t *testing.T) {
 	l := newLab(t)
-	l.tick()
-	old := l.readPage(itemsURL+"?limit=1")
-	l.clock = l.clock.Add(l.cfg.Retention + time.Second)
-	l.tick()
-	for _, path := range []string{itemsURL+"?cursor="+*old.Next, itemsURL+"?mode=WATERMARK&changedSince="+url.QueryEscape(old.Items[0].ChangedAt.Format(time.RFC3339Nano))} {
-		w := l.request("GET", path, "", "reader", 410)
-		if !strings.Contains(w.Body.String(), "CURSOR_EXPIRED") {
-			t.Fatal("wrong error")
-		}
+	base := "/collections/cantieri/items"
+	for _, id := range []string{"A", "B", "C"} {
+		l.inject("cantieri", "create", id)
 	}
+	p := l.page(base + "?limit=1")
+	if p.Mode != "SNAPSHOT" || !p.HasMore {
+		t.Fatal("incorrect collection default")
+	}
+	if w := l.request("GET", base+"?mode=CURSOR", "", "reader", 400); !strings.Contains(w.Body.String(), "MODE_NOT_OFFERED") {
+		t.Fatal(w.Body.String())
+	}
+	r := l.inject("cantieri", "delete", "B").Rows[0]
+	if r.DeleteVisibility == nil || *r.DeleteVisibility != "SNAPSHOT_ONLY" {
+		t.Fatal("missing deletion evidence")
+	}
+	snap := l.page(base)
+	if len(snap.Items) != 2 || snap.Resume.Cursor != "" || snap.Items[1].ID != "C" {
+		t.Fatal("invalid snapshot after delete")
+	}
+	page := l.page(base + "?mode=WATERMARK&limit=1&changedSince=" + l.clock.Format(time.RFC3339))
+	total := 0
+	for {
+		for _, it := range page.Items {
+			if it.Op == "DELETE" {
+				t.Fatal("hidden tombstone exposed")
+			}
+			total++
+		}
+		if !page.HasMore {
+			break
+		}
+		page = l.page(base + "?mode=WATERMARK&cursor=" + *page.Next)
+	}
+	if total != 3 {
+		t.Fatal(total)
+	}
+	l.request("GET", base+"?mode=WATERMARK&page=invalid", "", "reader", 400)
+}
+
+func TestDurableDelayDuplicateAndAtomicity(t *testing.T) {
+	l := newLab(t)
+	first := l.inject("edicole", "create", "A").Rows[0]
+	dup := l.inject("edicole", "duplicate", "A").Rows[0]
+	if !reflect.DeepEqual(first.Item, dup.Item) || dup.ContentSha256 != first.ContentSha256 || dup.Kind != "DUPLICATE" {
+		t.Fatal("duplicate changed content")
+	}
+	l.request("POST", "/admin/inject", `{"collection":"edicole","kind":"late","lateness":"PT11M"}`, "admin", 400)
+	next := l.command("inject", `{"collection":"edicole","id":"A","kind":"late","lateness":"PT5S"}`)
+	if len(next.Rows) != 0 || next.NextSince != dup.Sequence {
+		t.Fatal("pending event already visible")
+	}
+	l.clock = l.clock.Add(time.Second)
+	del := l.inject("edicole", "delete", "A").Rows[0]
+	if del.Item.Revision != 3 || del.DeleteVisibility == nil || *del.DeleteVisibility != "EXPLICIT" {
+		t.Fatal("wrong explicit delete")
+	}
+	l.restart()
+	l.clock = l.clock.Add(4 * time.Second)
+	late := l.expected("since=" + decimalSeq(del.Sequence)).Rows[0]
+	if late.Item.Revision != 2 || late.Kind != "LATE_UPDATE" || late.Lateness == nil || *late.Lateness != "PT5S" ||
+		!late.Item.ChangedAt.Before(del.Item.ChangedAt) || late.Sequence <= del.Sequence || len(l.page(itemsURL+"?mode=SNAPSHOT").Items) != 0 {
+		t.Fatal("late update resurrected retired object")
+	}
+	l.request("POST", "/admin/inject", `{"kind":"create","collection":"edicole","id":"X","count":2}`, "admin", 409)
+	if len(l.expected("since="+decimalSeq(late.Sequence)).Rows) != 0 {
+		t.Fatal("partial batch committed")
+	}
+}
+
+func TestSchemaRenderingAndRevert(t *testing.T) {
+	l := newLab(t)
+	l.command("inject", `{"collection":"edicole","kind":"create","count":3}`)
+	first := l.page(itemsURL + "?limit=1")
+	previous := first.Version
+	for _, edit := range []string{
+		`"action":"add","name":"places","type":"integer"`,
+		`"action":"rename","name":"places","newName":"enabled"`,
+		`"action":"type","name":"enabled","type":"boolean"`,
+		`"action":"nullable","name":"enabled","nullable":true`,
+		`"action":"describe","name":"enabled","description":"Flag"`,
+		`"action":"remove","name":"telefono"`,
+	} {
+		r := l.command("schema", `{"collection":"edicole",`+edit+"}")
+		page := l.page(itemsURL + "?cursor=" + *first.Next)
+		if r.SchemaVersion == previous || r.PreviousSchemaVersion != previous || page.Version != r.SchemaVersion || r.FieldsSha256 != page.FieldsSha256 {
+			t.Fatal("schema change missed between pages")
+		}
+		ledger := l.expected("collection=edicole&renderAs=" + page.Version)
+		row := ledger.Rows[1]
+		if row.EmittedSchemaVersion != first.Version || row.RenderedSchemaVersion != page.Version || row.ContentSha256 != digest(page.Items[0]) {
+			t.Fatal("renderAs differs from delivered content")
+		}
+		previous = page.Version
+	}
+	l.restart()
+	r := l.command("schema", `{"collection":"edicole","action":"revert","version":"`+first.Version+`"}`)
+	if r.SchemaVersion != first.Version || r.FieldsSha256 != first.FieldsSha256 {
+		t.Fatal("revert changed fingerprints")
+	}
+	l.request("GET", "/admin/expected?collection=edicole&renderAs=missing", "", "admin", 400)
+}
+
+func TestRetentionClockAndTornLine(t *testing.T) {
+	l := newLab(t)
+	idle := l.page(itemsURL)
+	l.command("clock", `{"advance":"P8D"}`)
+	l.inject("edicole", "create", "A")
+	l.command("clock", `{"advance":"PT1M"}`)
+	l.inject("edicole", "create", "B")
+	p := l.page(itemsURL + "?cursor=" + *idle.Next + "&limit=1")
+	want := l.now().Add(l.cfg.Retention)
+	if p.PositionExpiresAt == nil || !p.PositionExpiresAt.Equal(want) {
+		t.Fatal("expiry must refer to first unread arrival")
+	}
+	l.command("clock", `{"advance":"P6DT23H59M1S"}`)
+	// A is compacted, but only B is needed for this page.
+	b := l.page(itemsURL + "?cursor=" + *p.Next)
+	if len(b.Items) != 1 || b.Items[0].ID != "B" || b.PositionExpiresAt != nil {
+		t.Fatal("premature expiry")
+	}
+	l.command("clock", `{"advance":"PT1M"}`)
+	l.request("GET", itemsURL+"?cursor="+*p.Next, "", "reader", 410)
+	l.request("GET", itemsURL+"?mode=WATERMARK&changedSince="+url.QueryEscape(l.clock.Format(time.RFC3339)), "", "reader", 410)
 	f, err := os.OpenFile(l.path, os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = f.WriteString(`{"events":[`); err != nil {
+	if _, err := f.WriteString(`{"events":[`); err != nil {
 		t.Fatal(err)
 	}
-	if err = f.Close(); err != nil {
+	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
+	at := l.now()
 	l.restart()
-	if len(l.readPage(itemsURL).Items) != 3 || len(l.readPage(itemsURL+"?mode=SNAPSHOT").Items) != 6 || l.Floor != 6 {
-		t.Fatal("incorrect compacted state")
+	if !l.now().Equal(at) || len(l.page(itemsURL+"?mode=SNAPSHOT").Items) != 2 {
+		t.Fatal("compacted checkpoint or clock not restored")
 	}
-	l.tick()
+	l.inject("edicole", "update", "B")
 	l.restart()
-	if l.head() != 18 {
-		t.Fatal("failed to append after recovery")
+	l.command("reset", "{}")
+	l.request("GET", itemsURL+"?cursor="+*b.Next, "", "reader", 410)
+}
+
+func TestCredentialsErrorsAndProbes(t *testing.T) {
+	l := newLab(t)
+	for _, path := range []string{"/collections", "/collections/edicole/schema", itemsURL, "/admin/status", "/admin/expected", "/admin/expected/state", "/admin/rate", "/admin/inject", "/admin/schema", "/admin/clock", "/admin/outage", "/admin/reset"} {
+		wrong := "admin"
+		if strings.HasPrefix(path, "/admin") {
+			wrong = "reader"
+		}
+		for _, token := range []string{"", wrong} {
+			l.request("GET", path, "", token, 401)
+		}
+	}
+	l.request("GET", "/collections/missing/schema", "", "reader", 404)
+	l.command("outage", `{"kind":"UNAVAILABLE","duration":"PT5S","retryAfter":2}`)
+	l.restart()
+	if w := l.request("GET", "/collections", "", "reader", 503); w.Header().Get("Retry-After") != "2" {
+		t.Fatal("Retry-After")
+	}
+	for _, path := range []string{"live", "ready"} {
+		l.request("GET", "/health/"+path, "", "", 204)
+	}
+	l.command("clock", `{"advance":"PT5S"}`)
+	l.command("outage", `{"collection":"cantieri","kind":"RATE_LIMITED","duration":"PT3S"}`)
+	l.request("GET", "/collections/cantieri/items", "", "reader", 429)
+	l.cfg.ReadInterval = 1500 * time.Millisecond
+	l.page(itemsURL)
+	if w := l.request("GET", itemsURL, "", "reader", 429); w.Header().Get("Retry-After") != "2" {
+		t.Fatal("fractional Retry-After")
+	}
+	l.cfg.ClockControl = false
+	l.request("POST", "/admin/clock", `{"advance":"PT1S"}`, "admin", 404)
+}
+
+func TestCanonicalVectors(t *testing.T) {
+	if digest([]field{{"Caffè", "id", false, "string"}}) != "9d6a480a969b79b83dc6398f197b32c3c9dffa10e8cdd82dd34fa250fa632610" {
+		t.Fatal("fields vector")
+	}
+	in := json.RawMessage(`{"numbers":[333333333.33333329,1E30,4.50,2e-3,0.000000000000000000000000001],"string":"\u20ac$\u000F\u000aA'\u0042\u0022\u005c\\\"\/","literals":[null,true,false]}`)
+	want := `{"literals":[null,true,false],"numbers":[333333333.3333333,1e+30,4.5,0.002,1e-27],"string":"€$\u000f\nA'B\"\\\\\"/"}`
+	if got := canonical(in); !bytes.Equal(got, []byte(want)) {
+		t.Fatalf("RFC 8785 vector: %s", got)
+	}
+	if got := string(canonical(json.RawMessage(`{"\ue000":1,"😀":-0}`))); got != `{"😀":0,"":1}` {
+		t.Fatal("UTF-16 key order or negative zero")
 	}
 }
 
-func TestAuthHealthThrottleOutageAndReset(t *testing.T) {
+func decimalSeq(n int64) string {
+	return strconv.FormatInt(n, 10)
+}
+
+func TestSnapshotMatchesStateWithHiddenCursorDeletes(t *testing.T) {
 	l := newLab(t)
-	for _, token := range []string{"", "reader"} {
-		l.request("GET", "/admin/expected", "", token, 401)
+	d := l.Domain
+	d.Collections[1].Delta.Modes = append(d.Collections[1].Delta.Modes, "CURSOR")
+	writeDomain(t, l.cfg.DomainFile, d)
+	l.command("reset", `{"reloadDomain":true}`)
+	for _, id := range []string{"A", "B", "C"} {
+		l.inject("cantieri", "create", id)
 	}
-	for _, token := range []string{"", "admin"} {
-		l.request("GET", "/collections", "", token, 401)
+	l.inject("cantieri", "delete", "B")
+	l.inject("cantieri", "update", "C")
+	base := "/collections/cantieri/items"
+	changes := l.page(base + "?mode=CURSOR")
+	if len(changes.Items) != 4 || slices.ContainsFunc(changes.Items, func(it item) bool { return it.Op == "DELETE" }) {
+		t.Fatal("CURSOR exposed a snapshot-only delete")
 	}
-	l.request("GET", "/collections", "", "reader", 200)
-	l.command("rate", `{"readDelay":"1500ms","count":1}`)
-	l.tick()
-	p := l.readPage(itemsURL)
-	w := l.request("GET", itemsURL, "", "reader", 429)
-	if w.Header().Get("Retry-After") != "2" {
-		t.Fatal("Retry-After")
-	}
-	l.command("outage", `{"duration":"4s"}`)
-	l.restart()
-	l.request("GET", "/collections", "", "reader", 503)
-	for _, h := range []struct {
-		path string
-		code int
-	}{{"live", 200}, {"ready", 503}} {
-		if l.request("GET", "/health/"+h.path, "", "", h.code).Body.Len() != 0 {
-			t.Fatal("probe disclosed data")
+	want := map[string]item{}
+	p := l.page(base + "?limit=1")
+	for {
+		for _, it := range p.Items {
+			want[it.ID] = it
 		}
+		if !p.HasMore {
+			break
+		}
+		p = l.page(base + "?page=" + *p.Next)
 	}
-	l.clock = l.clock.Add(5*time.Second)
-	l.request("GET", "/health/ready", "", "", 200)
-	l.request("GET", itemsURL, "", "reader", 200)
-	l.command("reset", "{}")
-	l.request("GET", itemsURL+"?cursor="+*p.Next, "", "reader", 410)
-	if len(l.readPage(itemsURL).Items) != 0 || l.Rate.Count != 3 {
-		t.Fatal("reset")
+	q := "/admin/expected/state?collection=cantieri&renderAs=" + p.Version + "&limit=1"
+	after := ""
+	deleted := 0
+	for {
+		state := decode[struct {
+			Items     []stateRow
+			NextAfter *string
+		}](t, l.request("GET", q+"&after="+url.QueryEscape(after), "", "admin", 200))
+		for _, row := range state.Items {
+			if row.DeletedAt != nil {
+				if row.ID != "B" || row.Revision != 2 {
+					t.Fatal("unexpected retained tombstone")
+				}
+				deleted++
+				continue
+			}
+			it, ok := want[row.ID]
+			if !ok || it.Revision != row.Revision || !reflect.DeepEqual(it.Properties, row.Properties) || digest(it) != row.ContentSha256 {
+				t.Fatal("snapshot and expected state disagree")
+			}
+			delete(want, row.ID)
+		}
+		if state.NextAfter == nil {
+			break
+		}
+		after = *state.NextAfter
 	}
+	if len(want) != 0 || deleted != 1 {
+		t.Fatal("incomplete state")
+	}
+}
+
+func TestCatalogDigestAndSignedPositions(t *testing.T) {
+	l := newLab(t)
+	cat := decode[struct {
+		SchemaVersion string
+		Collections   []struct{ Collection, SchemaVersion string }
+	}](t, l.request("GET", "/collections", "", "reader", 200))
+	pairs := [][2]string{}
+	for _, c := range cat.Collections {
+		sc := decode[struct {
+			Fields       []field
+			Geometry     *geometry
+			Key          []string
+			FieldsSha256 string
+		}](t, l.request("GET", "/collections/"+c.Collection+"/schema", "", "reader", 200))
+		if digest(sc.Fields) != sc.FieldsSha256 || digest([]any{sc.Fields, sc.Key, sc.Geometry}) != c.SchemaVersion {
+			t.Fatal("incorrect public schema descriptors")
+		}
+		pairs = append(pairs, [2]string{c.Collection, c.SchemaVersion})
+	}
+	if cat.SchemaVersion != digest(pairs) || pairs[0][0] != "cantieri" {
+		t.Fatal("catalog must hash the sorted pair array")
+	}
+	p := l.page(itemsURL)
+	raw, tag, _ := strings.Cut(*p.Next, ".")
+	b, _ := b64.DecodeString(raw)
+	var forged position
+	if err := json.Unmarshal(b, &forged); err != nil {
+		t.Fatal(err)
+	}
+	forged.Epoch = "forged"
+	b, _ = json.Marshal(forged)
+	l.request("GET", itemsURL+"?cursor="+b64.EncodeToString(b)+"."+tag, "", "reader", 400)
+	l.request("GET", itemsURL+"?mode=WATERMARK&cursor="+*p.Next, "", "reader", 400)
 }

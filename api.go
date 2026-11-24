@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,115 +17,170 @@ import (
 type object = map[string]any
 
 func (s *store) catalogVersion() string {
-	versions := map[string]string{}
-	for name, c := range s.Collections {
-		versions[name] = c.Active
+	pairs := make([][2]string, 0, len(s.Collections))
+	for _, name := range slices.Sorted(maps.Keys(s.Collections)) {
+		pairs = append(pairs, [2]string{name, s.Collections[name].Active})
 	}
-	return digest(versions)
+	return digest(pairs)
+}
+
+func (s *store) version(name string) string {
+	if c := s.Collections[name]; c != nil {
+		return c.Active
+	}
+	return s.catalogVersion()
 }
 
 func (s *store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.URL.Path == "/health/live" || r.URL.Path == "/health/ready" {
+		status := http.StatusNoContent
+		if r.Method != "GET" {
+			status = http.StatusMethodNotAllowed
+		} else if r.URL.Path == "/health/ready" {
+			s.Lock()
+			f, err := os.OpenFile(s.path, os.O_WRONLY|os.O_APPEND, 0600)
+			if err == nil {
+				err = f.Close()
+			}
+			if s.failed != nil || err != nil {
+				status = http.StatusServiceUnavailable
+			}
+			s.Unlock()
+		}
+		w.WriteHeader(status)
+		return
+	}
+	path := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	admin := path[0] == "admin"
+	want := s.cfg.ReadToken
+	if admin {
+		want = s.cfg.AdminToken
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	scheme, value, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	hash := sha256.Sum256([]byte(value))
+	if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare(hash[:], want[:]) != 1 {
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		w.WriteHeader(401)
+		_, _ = io.WriteString(w, `{"code":"UNAUTHENTICATED"}`)
+		return
+	}
+
 	body := http.MaxBytesReader(w, r.Body, 32<<10)
 	defer body.Close()
-	// Read before taking the journal lock, so a slow request cannot stall ticks.
 	raw, err := io.ReadAll(body)
-	s.Lock()
-	version := s.catalogVersion()
-	path := strings.Split(strings.TrimPrefix(r.URL.Path, "/"), "/")
-	if len(path) >= 2 && path[0] == "collections" && s.Collections[path[1]] != nil {
-		version = s.Collections[path[1]].Active
+	name := ""
+	if admin {
+		name = r.URL.Query().Get("collection")
+		if r.Method == "POST" {
+			var scope struct{ Collection string }
+			_ = json.Unmarshal(raw, &scope)
+			name = scope.Collection
+		}
+	} else if path[0] == "collections" && len(path) >= 2 {
+		name = path[1]
 	}
-	status := 200
+
+	s.Lock()
+	s.at = s.clock().UTC()
 	var data any
 	var prob *problem
-	health := r.URL.Path == "/health/live" || r.URL.Path == "/health/ready"
-	if err != nil {
+	switch {
+	case s.maintain() != nil:
+		prob = unavailable
+	case err != nil:
 		prob = &problem{400, "INVALID_BODY"}
-	} else if health && r.Method == "GET" {
-		if r.URL.Path == "/health/ready" && (s.failed != nil || s.now().Before(s.OutageUntil)) {
-			status = 503
-		}
-	} else if path[0] == "admin" || path[0] == "collections" {
-		want := s.cfg.ReadToken
-		if path[0] == "admin" {
-			want = s.cfg.AdminToken
-		}
-		scheme, value, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-		hash := sha256.Sum256([]byte(value))
-		switch {
-		case !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare(hash[:], want[:]) != 1:
-			w.Header().Set("WWW-Authenticate", "Bearer")
-			prob = &problem{401, "UNAUTHORIZED"}
-		case s.compact() != nil:
-			prob = unavailable
-		case path[0] == "admin":
-			data, version, prob = s.admin(r, path, raw)
-		case s.now().Before(s.OutageUntil):
-			prob = unavailable
-		default:
-			data, prob = s.read(w, r, path, version)
-		}
-	} else {
-		prob = &problem{404, "NOT_FOUND"}
+	case name != "" && s.Collections[name] == nil:
+		prob = unknown
+	case admin:
+		data, prob = s.admin(r, raw, name)
+	case path[0] == "collections":
+		data, prob = s.read(w, r, path, name)
+	default:
+		prob = notFound
 	}
+	version := s.version(name)
+	status := 200
 	if prob != nil {
 		status = prob.status
-		data = object{"schemaVersion": version, "code": prob.code}
-	}
-	// Marshal inside the lock, including schema maps shared with journal state.
-	var encoded []byte
-	if data != nil {
-		encoded, err = json.Marshal(data)
-		if err != nil {
-			status = 500
-			encoded, _ = json.Marshal(object{"schemaVersion": version, "code": "ENCODING_ERROR"})
+		msg := object{"code": prob.code, "message": http.StatusText(status), "schemaVersion": version}
+		if s.Collections[name] != nil {
+			msg["collection"] = name
 		}
+		data = msg
 	}
+	encoded, encodeErr := json.Marshal(data)
+	s.at = time.Time{}
 	s.Unlock()
 	w.Header().Set("X-Schema-Version", version)
-	w.Header().Set("Cache-Control", "no-store")
-	if len(encoded) > 0 {
-		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if encodeErr != nil {
+		status = 500
+		encoded, _ = json.Marshal(object{"code": "ENCODING_ERROR", "message": "Internal Server Error", "schemaVersion": version})
 	}
 	w.WriteHeader(status)
-	if len(encoded) > 0 {
-		_, _ = w.Write(encoded)
-	}
+	_, _ = w.Write(encoded)
 }
 
-func (s *store) read(w http.ResponseWriter, r *http.Request, path []string, version string) (any, *problem) {
+func seconds(d time.Duration) int64 {
+	return 1 + int64((d-1)/time.Second)
+}
+
+func (s *store) read(w http.ResponseWriter, r *http.Request, path []string, name string) (any, *problem) {
 	if r.Method != "GET" {
-		return nil, &problem{405, "METHOD_NOT_ALLOWED"}
+		return nil, badMethod
+	}
+	now := s.now()
+	for _, scope := range []string{"", name} {
+		o := s.Outages[scope]
+		if now.Before(o.Until) {
+			retry := o.RetryAfter
+			if retry == 0 && o.Kind == "RATE_LIMITED" {
+				retry = seconds(o.Until.Sub(now))
+			}
+			if retry > 0 {
+				w.Header().Set("Retry-After", strconv.FormatInt(retry, 10))
+			}
+			if o.Kind == "RATE_LIMITED" {
+				return nil, &problem{429, "RATE_LIMITED"}
+			}
+			return nil, unavailable
+		}
 	}
 	if len(path) == 1 {
-		collections := []object{}
+		var rows []object
 		for _, name := range slices.Sorted(maps.Keys(s.Collections)) {
-			collections = append(collections, object{"collection": name, "title": map[string]string{"edicole": "Edicole comunali", "cantieri": "Cantieri comunali"}[name],
-				"schemaVersion": s.Collections[name].Active, "deltaModes": []string{"CURSOR", "WATERMARK", "SNAPSHOT"}, "retention": s.cfg.RetentionText})
+			c := s.Collections[name]
+			d := c.Definition
+			rows = append(rows, object{"collection": name, "title": d.Title, "schemaVersion": c.Active, "fieldsSha256": digest(c.Versions[c.Active].Fields),
+				"deltaModes": d.Delta.Modes, "defaultMode": d.Delta.Default, "deletions": d.Delta.Deletions, "maxLateness": c.Rate.MaxLateness,
+				"cycle": iso(s.Cycle), "retention": iso(s.cfg.Retention), "retainedFrom": c.RetainedFrom})
 		}
-		return object{"schemaVersion": version, "collections": collections}, nil
+		return object{"schemaVersion": s.catalogVersion(), "collections": rows}, nil
 	}
-	if len(path) != 3 || s.Collections[path[1]] == nil {
-		return nil, &problem{404, "NOT_FOUND"}
+	if len(path) != 3 || s.Collections[name] == nil {
+		return nil, notFound
 	}
-	name := path[1]
-	switch path[2] {
-	case "schema":
-		sc := s.Collections[name].Versions[version]
-		return object{"collection": name, "schemaVersion": version, "fields": sc.Fields, "key": sc.Key,
-			"geometry": sc.Geometry, "fieldsFingerprint": digest(sc.Fields)}, nil
-	case "items":
-		now := s.now()
-		if wait := s.lastRead[name].Add(s.Rate.ReadDelay).Sub(now); wait > 0 {
-			w.Header().Set("Retry-After", strconv.FormatInt(1+int64((wait-1)/time.Second), 10))
+	c := s.Collections[name]
+	if path[2] == "schema" || path[2] == "items" {
+		if wait := s.lastRead[name].Add(s.cfg.ReadInterval).Sub(now); wait > 0 {
+			w.Header().Set("Retry-After", strconv.FormatInt(seconds(wait), 10))
 			return nil, &problem{429, "RATE_LIMITED"}
 		}
+	}
+	switch path[2] {
+	case "schema":
+		s.lastRead[name] = now
+		sc := c.Versions[c.Active]
+		return object{"collection": name, "schemaVersion": c.Active, "fields": sc.Fields, "key": sc.Key,
+			"geometry": sc.Geometry, "fieldsSha256": digest(sc.Fields)}, nil
+	case "items":
 		data, prob := s.items(name, r.URL.Query())
 		if prob == nil {
 			s.lastRead[name] = now
 		}
 		return data, prob
 	default:
-		return nil, &problem{404, "NOT_FOUND"}
+		return nil, notFound
 	}
 }

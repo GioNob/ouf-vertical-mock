@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -13,6 +14,9 @@ import (
 )
 
 func run() error {
+	if len(os.Args) > 2 || (len(os.Args) == 2 && os.Args[1] != "serve") {
+		return fmt.Errorf("usage: ouf-vertical-mock serve")
+	}
 	c, err := loadConfig()
 	if err != nil {
 		return err
@@ -21,13 +25,14 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer s.lock.Close()
 	listener, err := net.Listen("tcp", ":"+c.Port)
 	if err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	server := &http.Server{Handler: s, ReadHeaderTimeout: 5*time.Second, ReadTimeout: 15*time.Second, IdleTimeout: time.Minute}
+	server := &http.Server{Handler: s, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 8 * time.Second, WriteTimeout: 8 * time.Second, IdleTimeout: time.Minute}
 	generatorDone := make(chan struct{})
 	go func() {
 		defer close(generatorDone)
@@ -37,13 +42,20 @@ func run() error {
 	go func() { serveDone <- server.Serve(listener) }()
 	select {
 	case <-ctx.Done():
-		timeout, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		err = server.Shutdown(timeout)
 	case err = <-serveDone:
 		stop()
 	}
-	<-generatorDone
+	deadline, cancel := context.WithTimeout(context.Background(), 9*time.Second)
+	defer cancel()
+	if shutdownErr := server.Shutdown(deadline); shutdownErr != nil {
+		_ = server.Close()
+		return shutdownErr
+	}
+	select {
+	case <-generatorDone:
+	case <-deadline.Done():
+		return deadline.Err()
+	}
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}

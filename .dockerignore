@@ -2,3 +2,5 @@
 !go.mod
 !*.go
 !Dockerfile
+!examples/
+!examples/domain-lab.json

@@ -112,6 +112,16 @@ func TestDeterministicGenerationAndProjection(t *testing.T) {
 		}
 	}
 	ra, rb := a.expected("collection=edicole"), b.expected("collection=edicole")
+	// The epoch is random by contract (G10): determinism covers everything else.
+	if len(ra.Rows) != len(rb.Rows) {
+		t.Fatal("same seed and clock diverged")
+	}
+	for i := range rb.Rows {
+		if rb.Rows[i].Epoch == "" || ra.Rows[i].Epoch == "" {
+			t.Fatal("register row without epoch")
+		}
+		rb.Rows[i].Epoch = ra.Rows[i].Epoch
+	}
 	if !reflect.DeepEqual(ra, rb) {
 		t.Fatal("same seed and clock diverged")
 	}

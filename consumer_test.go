@@ -196,7 +196,11 @@ func (c *consumer) pollUntil(l *lab, path string, interruptAfter int) {
 		case 429, 503:
 			return
 		case 410:
+			failure := decode[struct{ Reason string }](l.T, w)
 			c.Block = "POSITION_LOST"
+			if failure.Reason == "EPOCH_CHANGED" {
+				c.Block = "SOURCE_EPOCH_CHANGED"
+			}
 			c.save(l.T, path)
 			return
 		case 200:
@@ -256,18 +260,28 @@ func checkInvariants(l *lab, c *consumer) {
 		rev  int64
 		hash string
 	}
+	// Only the test oracle inspects the mock's signed checkpoint. A tail
+	// covers all arrivals through Low, even when the source has moved on.
+	confirmed, prob := l.decode(c.Confirmed, "edicole", "CURSOR")
+	if prob != nil || !confirmed.Tail {
+		l.Fatal("I3 needs a confirmed, complete arrival window")
+	}
+	asOf := confirmed.Low
 	want, got := map[key]int{}, map[key]int{}
 	var since int64
-	for {
+	for since < asOf {
 		p := l.expected("collection=edicole&renderAs=" + c.Version + "&limit=17&since=" + decimalSeq(since))
 		for _, r := range p.Rows {
+			if r.Sequence > asOf {
+				break
+			}
 			if r.Sequence <= since || r.ContentSha256 != digest(r.Item) || r.RenderedSchemaVersion != c.Version {
 				l.Fatalf("invalid oracle row %d", r.Sequence)
 			}
 			want[key{r.Item.ID, r.Item.Revision, r.ContentSha256}]++
 			since = r.Sequence
 		}
-		if !p.HasMore {
+		if !p.HasMore || p.NextSince >= asOf {
 			break
 		}
 	}
@@ -291,9 +305,14 @@ func checkInvariants(l *lab, c *consumer) {
 	count, after := 0, ""
 	for {
 		p := decode[struct {
+			AsOf      *int64
+			Epoch     string
 			Items     []stateRow
 			NextAfter *string
-		}](l.T, l.request("GET", "/admin/expected/state?collection=edicole&limit=3&renderAs="+c.Version+"&after="+url.QueryEscape(after), "", "admin", 200))
+		}](l.T, l.request("GET", "/admin/expected/state?collection=edicole&asOf="+decimalSeq(asOf)+"&limit=3&renderAs="+c.Version+"&after="+url.QueryEscape(after), "", "admin", 200))
+		if p.AsOf == nil || *p.AsOf != asOf || p.Epoch != confirmed.Epoch {
+			l.Fatal("I3 oracle returned a different cut")
+		}
 		for _, r := range p.Items {
 			state, ok := c.Objects[r.ID]
 			if !ok || state.Revision != r.Revision || state.Retired != (r.DeletedAt != nil) ||
@@ -377,15 +396,40 @@ func TestReferenceConsumer(t *testing.T) {
 			c = restore(l.T, path)
 		}
 		if cycle%25 == 0 {
-			// A frozen poll can finish below the head after an outage.
-			// Drain the next window at the same clock before comparing I3.
-			c.poll(l, path)
 			checkInvariants(l, &c)
 		}
 	}
 	l.command("clock", `{"advance":"PT10M"}`)
 	c.poll(l, path)
 	checkInvariants(l, &c)
+}
+
+func TestReferenceBootstrapWithRetainedDelete(t *testing.T) {
+	l := newLab(t)
+	l.inject("edicole", "create", "A")
+	l.command("inject", `{"collection":"edicole","kind":"late","id":"A","lateness":"PT2S"}`)
+	deletion := l.inject("edicole", "delete", "A").Rows[0]
+	sc := l.page(itemsURL)
+	c := consumer{Version: sc.Version, Fields: sc.FieldsSha256, Objects: map[string]lastState{}}
+	path := filepath.Join(t.TempDir(), "consumer.json")
+	c.snapshot(l, path, false)
+	state := c.Objects["A"]
+	if !state.Retired || state.UUID != "" || state.Revision != deletion.Item.Revision {
+		t.Fatal("bootstrap lost the retained tombstone")
+	}
+	l.command("clock", `{"advance":"PT2S"}`)
+	c.poll(l, path)
+	if len(c.Lineage) != 2 || c.Lineage[1].Outcome != "SUPERSEDED" || c.Objects["A"].Revision != state.Revision || !c.Objects["A"].Retired {
+		t.Fatal("catch-up resurrected an object deleted before bootstrap")
+	}
+	confirmed := c.Confirmed
+	l.command("reset", "{}")
+	l.inject("edicole", "create", "A")
+	c.poll(l, path)
+	c = restore(t, path)
+	if c.Block != "SOURCE_EPOCH_CHANGED" || c.Confirmed != confirmed || len(c.Lineage) != 2 {
+		t.Fatal("old position crossed into a new history")
+	}
 }
 
 func TestReferenceRulesAndRecovery(t *testing.T) {
@@ -454,6 +498,7 @@ func TestReferenceRestartInsidePage(t *testing.T) {
 	if len(c.Lineage) != 3 {
 		t.Fatal("restart duplicated the first outcome or changed the page")
 	}
+	checkInvariants(l, &c) // the fourth arrival is still beyond the confirmed window
 	c.poll(l, path)
 	checkInvariants(l, &c)
 }

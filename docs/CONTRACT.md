@@ -1,6 +1,6 @@
 # Contratto HTTP `ouf.vertical-mock.v1`
 
-Implementa `ouf.vertical-source.v1` e le garanzie G1-G9 di `ouf.delta-position.v1`. Le estensioni della busta sono compatibili con i consumatori della fonte v1.
+Implementa `ouf.vertical-source.v1` e le garanzie G1–G10 della revisione 2 di `ouf.delta-position.v1`. Le estensioni della busta sono compatibili con i consumatori della fonte v1.
 
 ## 1. Ruolo e perimetro
 Il mock è un servizio HTTP **generico**. Genera a cicli le istanze di un dominio dichiarato in un file (§5) e le espone come un verticale reale.
@@ -26,24 +26,25 @@ Nel repository e nell'immagine non ci sono dati reali, indirizzi, domini o accou
 - **Quale versione:**
   - per le risorse di una collezione, la versione **corrente** della collezione al momento della risposta;
   - per il catalogo e per i comandi globali, il **digest del catalogo**: SHA-256 del JSON canonico dell'elenco `[[collection, schemaVersion], …]` ordinato per `collection`.
-- **Errori:** `{"code","message","collection"?,"schemaVersion"}`. `message` è un testo fisso in inglese, senza dati.
+- **Errori:** `{"code","message","collection"?,"schemaVersion"}`. `message` è un testo fisso in inglese, senza dati. Per `410 CURSOR_EXPIRED` la risposta aggiunge `reason` e, al cambio di epoca, `epoch` (§4.3).
 - **JSON canonico:** RFC 8785 (JCS). Vale per tutte le impronte di questo contratto. Il vettore di controllo del task-04 resta valido (§4.2).
 
 ## 4. Risorse di lettura
 
 ### 4.1 `GET /collections`
 ```json
-{"schemaVersion": "<digest del catalogo>",
+{"schemaVersion": "<digest del catalogo>", "epoch": "<32 cifre esadecimali>",
  "collections": [{
-   "collection": "edicole", "title": "Edicole (dati fittizi)",
+   "collection": "edicole", "title": "Edicole (dati fittizi)", "epoch": "<stessa epoca>",
    "schemaVersion": "<64 esadecimali>", "fieldsSha256": "<64 esadecimali>",
    "deltaModes": ["CURSOR", "WATERMARK", "SNAPSHOT"], "defaultMode": "CURSOR",
    "deletions": "EXPLICIT",
    "maxLateness": "PT10M", "retention": "P7D", "retainedFrom": "2026-11-17T22:00:00Z",
    "cycle": "PT1M"}]}
 ```
+- `epoch` identifica la storia del journal con 16 byte casuali in esadecimale. Tutte le collezioni condividono l’epoca del catalogo. Il riavvio la conserva e `reset` ne crea una nuova. `id` e `revision` possono ripetersi fra epoche.
 - `deletions`:
-  - `EXPLICIT`: le cancellazioni sono eventi `DELETE` nelle modalità a delta;
+  - `EXPLICIT`: le cancellazioni sono eventi `DELETE` nei delta e compaiono nello snapshot finché conservate (§4.3);
   - `SNAPSHOT_ABSENCE`: nessun `DELETE` nelle modalità a delta; un oggetto cancellato sparisce solo dagli snapshot. In questo caso `SNAPSHOT` deve essere fra le `deltaModes`.
 - `maxLateness`: il ritardo massimo dichiarato fra `changedAt` e la visibilità di un evento (G6).
 - `retainedFrom`: il limite della compattazione. Una posizione è completa solo se non è anteriore a questo istante (G7).
@@ -78,7 +79,7 @@ Parametri incoerenti con la modalità danno `400 INVALID_POSITION`.
 
 **Busta:**
 ```json
-{"collection": "edicole", "schemaVersion": "…", "fieldsSha256": "…", "mode": "CURSOR",
+{"collection": "edicole", "schemaVersion": "…", "fieldsSha256": "…", "epoch": "<epoca corrente>", "mode": "CURSOR",
  "items": [
    {"id": "E-000042", "revision": 7, "op": "UPSERT", "changedAt": "2026-11-24T22:15:02Z", "properties": {"id": "E-000042", "…": "…"}},
    {"id": "E-000017", "revision": 4, "op": "DELETE", "changedAt": "2026-11-24T22:15:03Z"}],
@@ -100,14 +101,15 @@ Parametri incoerenti con la modalità danno `400 INVALID_POSITION`.
   - senza `afterId` comprende tutti gli `id` all'istante indicato;
   - sull'ultima pagina `next=null`. Il consumatore costruisce il poll successivo da solo, con il ritardo di sicurezza (`ouf.delta-position.v1` §4.2).
 - **`SNAPSHOT`:**
-  - è lo stato degli oggetti vivi in un punto della sequenza di arrivo, fissato dalla prima pagina. Gli item sono `UPSERT` con l'ultima revisione;
-  - tutte le pagine hanno lo stesso `snapshotId`. Solo l'ultima ha `snapshotComplete=true`, le altre `false`;
+  - la prima pagina fissa il taglio della sequenza di arrivo. Per ogni oggetto vivo compare un `UPSERT` con la massima revisione visibile al taglio. Con `EXPLICIT` compare anche ogni oggetto cancellato il cui `DELETE` è ancora conservato al taglio. L’item contiene solo `id`, `revision`, `op: "DELETE"` e `changedAt` della cancellazione e segue lo stesso ordinamento degli `UPSERT`. Con `SNAPSHOT_ABSENCE` gli oggetti cancellati restano assenti;
+  - tutte le pagine riportano lo stesso `snapshotId` e lo stesso `snapshotAt`, uguale a `resume.snapshotAt` sull’ultima. Solo l'ultima ha `snapshotComplete=true`, le altre `false`;
   - l'ultima pagina porta `resume`, con un campo per ogni modalità a delta offerta. Esempio: `{"cursor":"…","watermark":{"changedSince":"…"},"snapshotAt":"…"}` (G9). Il punto dello snapshot è l'istante `snapshotAt` del mock in cui la prima pagina ha fissato il limite della sequenza;
     - **`cursor`** riparte **esattamente** dal punto dello snapshot: contiene tutti e soli gli arrivi successivi;
     - **`watermark`** è una ripresa **sicura, non esatta**: `changedSince = snapshotAt − maxLateness`, senza `afterId`. Per G6, ogni evento non ancora visibile al punto dello snapshot ha `changedAt` successivo a quell'istante. La risposta può ripetere eventi già coperti dallo snapshot. Il consumatore li scarta per chiave dell'evento (`ouf.delta-position.v1` §4.2 e §7). Con una soglia temporale una ripresa esatta non è possibile: un evento in ritardo può avere `changedAt` anteriore a eventi già visibili.
 - **`positionExpiresAt`:**
   - è l'istante oltre il quale `next`, o `resume`, non sarà più completa: la data di registrazione del primo evento non ancora coperto, più la retention;
-  - vale `null` se non ci sono eventi dopo la posizione. In quel caso la posizione resta valida finché non arriva un evento.
+  - durante uno snapshot conta anche la scadenza del primo arrivo corrispondente a un `DELETE` ancora da leggere. Una continuazione che lo ha perso dà `410` con `reason: "RETENTION"`;
+  - vale `null` se nessun arrivo necessario alla posizione è in scadenza.
 
 **Errori tipizzati:**
 
@@ -115,7 +117,7 @@ Parametri incoerenti con la modalità danno `400 INVALID_POSITION`.
 |---|---|---|
 | 400 | `INVALID_LIMIT`, `INVALID_MODE`, `MODE_NOT_OFFERED`, `INVALID_POSITION` | Parametri non validi o token alterato |
 | 404 | `UNKNOWN_COLLECTION` | Collezione assente. `schemaVersion` è il digest del catalogo |
-| 410 | `CURSOR_EXPIRED` | La posizione è anteriore a `retainedFrom`, oppure appartiene a un'epoca precedente a un `reset` |
+| 410 | `CURSOR_EXPIRED` | Il corpo riporta sempre `reason`. `EPOCH_CHANGED` indica una posizione firmata di un’epoca precedente e include l’`epoch` corrente. `RETENTION` indica compattazione, anche per `changedSince` anteriore a `retainedFrom` |
 | 429 | `RATE_LIMITED` | Limite di letture o guasto simulato; c'è sempre `Retry-After` in secondi interi |
 | 503 | `SOURCE_UNAVAILABLE` | Guasto simulato; `Retry-After` se noto |
 
@@ -179,7 +181,7 @@ I comandi sono atomici. Un lotto che non si può eseguire per intero fallisce co
 | `POST /admin/outage` | `{"collection"?, "kind": "UNAVAILABLE\|RATE_LIMITED", "duration", "retryAfter"?}` | Guasto simulato sulle sole risorse di lettura. `duration` uguale a `PT0S` chiude subito. La generazione continua |
 | `POST /admin/clock` | `{"advance": "PT6H"}` | Sposta in avanti l'orologio del mock, mai indietro. Serve a provare retention e ritardi senza attese. Disponibile solo con `OUF_MOCK_CLOCK_CONTROL=enabled`, altrimenti `404` |
 | `POST /admin/reset` | `{"reloadDomain"?: false}` | Nuova epoca: storia vuota, schemi iniziali, posizioni precedenti scadute (`410`) |
-| `GET /admin/status` | — | Configurazione effettiva, generazione per collezione, eventi in attesa di visibilità, guasto, testa e limite della sequenza, `retainedFrom`, scarto dell'orologio, impronte del file di dominio e del journal |
+| `GET /admin/status` | — | `epoch` corrente, configurazione effettiva, generazione per collezione, eventi in attesa di visibilità, guasto, testa e limite della sequenza, `retainedFrom`, scarto dell'orologio, impronte del file di dominio e del journal |
 
 **Semantica del ritardo** (`late`, sia generato sia iniettato):
 - l'evento nasce con `changedAt` = adesso e con la revisione successiva dell'oggetto, e resta **in attesa**;
@@ -195,7 +197,7 @@ I comandi sono atomici. Un lotto che non si può eseguire per intero fallisce co
 **`GET /admin/expected?since=<seq>&limit=<1..5000>&collection=<c>?&renderAs=<schemaVersion>?`** elenca, in ordine di arrivo, gli eventi **visibili** con sequenza maggiore di `since`:
 ```json
 {"schemaVersion": "…", "rows": [{
-   "sequence": 123, "recordedAt": "…", "collection": "edicole",
+   "sequence": 123, "epoch": "<epoca corrente>", "recordedAt": "…", "collection": "edicole",
    "origin": "GENERATED|INJECTED", "kind": "CREATE|UPDATE|DELETE|DUPLICATE|LATE_UPDATE",
    "lateness": "PT3M|null", "deleteVisibility": "EXPLICIT|SNAPSHOT_ONLY|null",
    "emittedSchemaVersion": "…", "renderedSchemaVersion": "…",
@@ -207,14 +209,16 @@ I comandi sono atomici. Un lotto che non si può eseguire per intero fallisce co
   - rende ogni item con uno schema già visto nella collezione, per esempio quello approvato in ouf;
   - senza `renderAs` vale lo schema in vigore all'emissione;
   - una versione sconosciuta dà `400 UNKNOWN_SCHEMA_VERSION`.
+- Ogni riga riporta l’`epoch` dell’arrivo, anche nelle risposte dei comandi. `contentSha256` coincide con `itemSha256` di `ouf.delta-position.v1` §2.
 - **`contentSha256`** è lo SHA-256 del JSON canonico dell'oggetto `item` così come è reso. Il consumatore ricalcola la stessa impronta sugli item ricevuti, con i valori ricevuti e senza riformattarli. Così confronta il registro con lineage, handoff e ACK (`ouf.delta-position.v1` §10).
 - Gli eventi in attesa non compaiono nel registro e si contano in `/admin/status`.
 
-**`GET /admin/expected/state?collection=<c>&renderAs=?&after=<id>?&limit=?`** dà lo stato atteso alla testa della sequenza:
+**`GET /admin/expected/state?collection=<c>&asOf=<sequence>&renderAs=?&after=<id>?&limit=?`** restituisce lo stato subito dopo l’arrivo con sequenza globale `asOf`, incluso. Senza `asOf` usa la testa osservata durante la richiesta. La busta riporta il taglio effettivo `asOf`, `epoch`, `schemaVersion` corrente e `renderedSchemaVersion`. Gli item sono ordinati per `id`.
+
 - oggetti vivi: `id`, `revision`, `changedAt`, `properties`, `contentSha256`;
 - oggetti cancellati ancora conservati: `id`, ultima `revision`, `deletedAt`.
 
-Serve a confrontare lo stato corrente in UDP.
+Il limite inferiore incluso è `floor` di `/admin/status`. Un taglio precedente dà `410 CURSOR_EXPIRED` con `reason: "RETENTION"`. Un valore negativo, non intero o oltre la testa dà `400 INVALID_POSITION`. Per verificare I3, usare su tutte le pagine lo stesso `asOf`, pari all’ultima sequenza coperta dalla posizione confermata, e la stessa resa `renderAs`.
 
 ## 7. Sonde e processo
 - `GET /health/live` restituisce `204`.

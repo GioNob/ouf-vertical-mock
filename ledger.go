@@ -20,7 +20,7 @@ func (s *store) row(e record, version string) object {
 			visibility = "SNAPSHOT_ONLY"
 		}
 	}
-	return object{"sequence": e.Seq, "recordedAt": e.RecordedAt, "collection": e.Collection,
+	return object{"sequence": e.Seq, "epoch": s.Epoch, "recordedAt": e.RecordedAt, "collection": e.Collection,
 		"origin": e.Origin, "kind": e.Kind, "lateness": lateness, "deleteVisibility": visibility,
 		"emittedSchemaVersion": e.Version, "renderedSchemaVersion": version, "item": it, "contentSha256": digest(it)}
 }
@@ -51,11 +51,23 @@ func (s *store) ledger(q url.Values, name string, state bool) (any, *problem) {
 		if version == "" {
 			version = c.Active
 		}
+		asOf := s.head()
+		if q.Has("asOf") {
+			var err error
+			asOf, err = strconv.ParseInt(q.Get("asOf"), 10, 64)
+			if len(q["asOf"]) != 1 || err != nil || asOf < 0 || asOf > s.head() {
+				return nil, badPosition
+			}
+			if asOf < s.Floor {
+				return nil, expired
+			}
+		}
+		index := s.stateAt(name, asOf)
 		items := []object{}
 		after := q.Get("after")
 		var next any
-		for _, id := range slices.Sorted(maps.Keys(c.live)) {
-			e := c.live[id]
+		for _, id := range slices.Sorted(maps.Keys(index)) {
+			e := index[id]
 			if id <= after || (e.Op == "DELETE" && e.Seq <= s.Floor) {
 				continue
 			}
@@ -72,7 +84,7 @@ func (s *store) ledger(q url.Values, name string, state bool) (any, *problem) {
 			}
 			items = append(items, row)
 		}
-		return object{"collection": name, "schemaVersion": c.Active, "renderedSchemaVersion": version, "items": items, "nextAfter": next, "hasMore": next != nil}, nil
+		return object{"collection": name, "asOf": asOf, "epoch": s.Epoch, "schemaVersion": c.Active, "renderedSchemaVersion": version, "items": items, "nextAfter": next, "hasMore": next != nil}, nil
 	}
 	since := s.Floor
 	if q.Has("since") {

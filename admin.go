@@ -84,7 +84,7 @@ func (s *store) status() object {
 	if b, err := os.ReadFile(s.cfg.DomainFile); err == nil {
 		fileHash = hashBytes(b)
 	}
-	return object{"schemaVersion": s.catalogVersion(), "journalFormat": s.Format, "domainFileSha256": fileHash, "journalDomainSha256": s.DomainHash,
+	return object{"epoch": s.Epoch, "schemaVersion": s.catalogVersion(), "journalFormat": s.Format, "domainFileSha256": fileHash, "journalDomainSha256": s.DomainHash,
 		"generation": rates, "pending": len(s.Pending), "pendingByCollection": pending, "outages": activeOutages, "head": s.head(), "floor": s.Floor,
 		"retainedFrom": retained, "clockOffset": iso(s.Offset), "cycle": iso(s.Cycle), "retention": iso(s.cfg.Retention), "maxLateness": iso(s.cfg.MaxLate),
 		"readMinInterval": iso(s.cfg.ReadInterval), "clockControl": s.cfg.ClockControl, "port": s.cfg.Port, "seed": s.Seed, "dataDir": s.cfg.Dir, "domainFile": s.cfg.DomainFile}

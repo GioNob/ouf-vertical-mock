@@ -22,15 +22,15 @@ La sonda locale è `http://localhost:8080/health/ready`. La generazione inizia d
 
 ## Container e cancello della pipeline
 
-L'immagine Alpine esegue il binario come `10008:10008`. Il volume dati assume la proprietà della directory predisposta nell'immagine. I percorsi dei file dei bearer sono mount di sola lettura. L'esempio usa i due file dimostrativi appena creati, in una directory privata.
+L'immagine Alpine esegue il binario come `10008:10008`. La directory dati è sempre un **bind mount in lettura e scrittura (RW) di una directory dell’host**. Il rilascio dei moduli riusa i bind del predecessore, quindi un volume nominato è escluso. La directory dell’host deve essere scrivibile da `10008:10008`. I percorsi dei file dei bearer sono mount di sola lettura. L'esempio usa i due file dimostrativi appena creati, in una directory privata.
 
 ```sh
 docker build -t ouf-vertical-mock:local .
 chmod 0444 "$lab/read" "$lab/admin"
-volume=$(docker volume create)
+sudo install -d -m 0700 -o 10008 -g 10008 "$lab/container-data"
 gate='OUF_APPLICATION_GATE=0; trap "OUF_APPLICATION_GATE=1" USR1; while [ "$OUF_APPLICATION_GATE" = 0 ]; do sleep 1 & wait "$!"; done; exec "$@"'
 cid=$(docker run -d --read-only --cap-drop ALL --security-opt no-new-privileges \
-  --mount "type=volume,src=$volume,dst=/var/lib/ouf-vertical-mock" \
+  --mount "type=bind,src=$lab/container-data,dst=/var/lib/ouf-vertical-mock" \
   --mount "type=bind,src=$lab/read,dst=/run/mock-read,readonly" \
   --mount "type=bind,src=$lab/admin,dst=/run/mock-admin,readonly" \
   -e OUF_MOCK_DATA_DIR=/var/lib/ouf-vertical-mock \
@@ -106,11 +106,11 @@ curl -sS -G -H "$admin_auth" "$base/admin/expected/state" \
   --data-urlencode collection=edicole --data-urlencode limit=50
 ```
 
-Per gli eventi seguire `nextSince` finché `hasMore` è vero. `since` omesso parte dal limite della storia conservata. Per lo stato seguire `nextAfter` nel parametro `after`. `renderAs` accetta una versione già vista nella collezione e permette di ricalcolare `contentSha256` sull'item così come ricevuto. I tombstone nascosti dai delta compaiono nel registro con `deleteVisibility: SNAPSHOT_ONLY`.
+Per gli eventi seguire `nextSince` finché `hasMore` è vero. `since` omesso parte dal limite della storia conservata. Per lo stato seguire `nextAfter` nel parametro `after` e conservare lo stesso `asOf` su ogni pagina. Per I3, `asOf` è l’ultima sequenza coperta dalla posizione confermata. `renderAs` accetta una versione già vista nella collezione e permette di ricalcolare `contentSha256` sull'item così come ricevuto. I tombstone nascosti dai delta compaiono nel registro con `deleteVisibility: SNAPSHOT_ONLY`.
 
-Il consumatore approva `schemaVersion` e `fieldsSha256` prima di elaborare **ogni pagina**. Conserva la posizione candidata finché tutti gli item hanno un esito durevole, poi conferma la posizione. Un cambio di schema blocca il checkpoint. Dopo un `revert` la lettura può riprendere dalla stessa posizione. Le chiavi `(revision, basis)` stabiliscono l'ordine degli effetti per oggetto. Una revisione superata resta in lineage, un duplicato conserva l'effetto già applicato e un tombstone mantiene la revisione dell'oggetto ritirato.
+Il consumatore approva `schemaVersion` e `fieldsSha256` prima di elaborare **ogni pagina**. Conserva la posizione candidata finché tutti gli item hanno un esito durevole, poi conferma la posizione. Un cambio di schema blocca il checkpoint. Dopo un `revert` la lettura può riprendere dalla stessa posizione. Le revisioni si confrontano all’interno della stessa epoca. Una revisione superata resta in lineage, un duplicato conserva l'effetto già applicato e un tombstone mantiene la revisione dell'oggetto ritirato.
 
-Uno snapshot completo dà `snapshotId` e `resume.snapshotAt`. `resume.cursor` comprende esattamente gli arrivi successivi. `resume.watermark.changedSince` arretra di `maxLateness` e richiede deduplica. Il `410` segnala `POSITION_LOST` e richiede una ripresa completa governata. Per un `429` o un `503` il consumatore mantiene la posizione e rispetta `Retry-After`. Le regole normative sono in `ouf.delta-position.v1`, sezioni 3–8. [Contratto HTTP](docs/CONTRACT.md) · [Consumatore di riferimento](consumer_test.go)
+Ogni pagina di snapshot riporta `epoch`, `snapshotId` e `snapshotAt`. Con cancellazioni esplicite lo snapshot comprende anche i `DELETE` conservati. L’ultima pagina riporta lo stesso `snapshotAt` in `resume`. `resume.cursor` comprende esattamente gli arrivi successivi. `resume.watermark.changedSince` arretra di `maxLateness` e richiede deduplica. Il `410` distingue `RETENTION` (posizione persa) da `EPOCH_CHANGED` (nuova storia, con l’epoca corrente nel corpo). Per un `429` o un `503` il consumatore mantiene la posizione e rispetta `Retry-After`. Le regole normative sono in `ouf.delta-position.v1`, sezioni 3–8. [Contratto HTTP](docs/CONTRACT.md) · [Consumatore di riferimento](consumer_test.go)
 
 ## CI e consegna
 

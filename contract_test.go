@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http/httptest"
 	"net/url"
@@ -98,7 +99,7 @@ func decode[T any](t *testing.T, w *httptest.ResponseRecorder) T {
 type ledgerRow struct {
 	Sequence                                    int64
 	RecordedAt                                  time.Time
-	Collection, Origin, Kind                    string
+	Collection, Origin, Kind, Epoch             string
 	Lateness, DeleteVisibility                  *string
 	EmittedSchemaVersion, RenderedSchemaVersion string
 	Item                                        item
@@ -147,7 +148,8 @@ func TestSnapshotResumeAndRestart(t *testing.T) {
 		*p.SnapshotID != *end.SnapshotID || *p.SnapshotComplete || !*end.SnapshotComplete || p.Resume != nil || end.Resume == nil {
 		t.Fatal("snapshot moved across a delayed arrival")
 	}
-	if !end.Resume.SnapshotAt.Equal(l.clock) || len(end.Resume.Watermark) != 1 || end.Resume.Watermark["changedSince"] != l.clock.Add(-10*time.Minute).Format(time.RFC3339Nano) {
+	if p.SnapshotAt == nil || end.SnapshotAt == nil || !p.SnapshotAt.Equal(*end.SnapshotAt) || !end.SnapshotAt.Equal(end.Resume.SnapshotAt) ||
+		!end.Resume.SnapshotAt.Equal(l.clock) || len(end.Resume.Watermark) != 1 || end.Resume.Watermark["changedSince"] != l.clock.Add(-10*time.Minute).Format(time.RFC3339Nano) {
 		t.Fatal("unsafe watermark resume point")
 	}
 	poll := itemsURL + "?cursor=" + end.Resume.Cursor
@@ -248,8 +250,9 @@ func TestDurableDelayDuplicateAndAtomicity(t *testing.T) {
 	l.restart()
 	l.clock = l.clock.Add(4 * time.Second)
 	late := l.expected("since=" + decimalSeq(del.Sequence)).Rows[0]
+	snapshot := l.page(itemsURL + "?mode=SNAPSHOT")
 	if late.Item.Revision != 2 || late.Kind != "LATE_UPDATE" || late.Lateness == nil || *late.Lateness != "PT5S" ||
-		!late.Item.ChangedAt.Before(del.Item.ChangedAt) || late.Sequence <= del.Sequence || len(l.page(itemsURL+"?mode=SNAPSHOT").Items) != 0 {
+		!late.Item.ChangedAt.Before(del.Item.ChangedAt) || late.Sequence <= del.Sequence || len(snapshot.Items) != 1 || !reflect.DeepEqual(snapshot.Items[0], del.Item) {
 		t.Fatal("late update resurrected retired object")
 	}
 	l.request("POST", "/admin/inject", `{"kind":"create","collection":"edicole","id":"X","count":2}`, "admin", 409)
@@ -310,8 +313,8 @@ func TestRetentionClockAndTornLine(t *testing.T) {
 		t.Fatal("premature expiry")
 	}
 	l.command("clock", `{"advance":"PT1M"}`)
-	l.request("GET", itemsURL+"?cursor="+*p.Next, "", "reader", 410)
-	l.request("GET", itemsURL+"?mode=WATERMARK&changedSince="+url.QueryEscape(l.clock.Format(time.RFC3339)), "", "reader", 410)
+	l.expiry(itemsURL+"?cursor="+*p.Next, "reader", "RETENTION")
+	l.expiry(itemsURL+"?mode=WATERMARK&changedSince="+url.QueryEscape(l.clock.Format(time.RFC3339)), "reader", "RETENTION")
 	f, err := os.OpenFile(l.path, os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +333,7 @@ func TestRetentionClockAndTornLine(t *testing.T) {
 	l.inject("edicole", "update", "B")
 	l.restart()
 	l.command("reset", "{}")
-	l.request("GET", itemsURL+"?cursor="+*b.Next, "", "reader", 410)
+	l.expiry(itemsURL+"?cursor="+*b.Next, "reader", "EPOCH_CHANGED")
 }
 
 func TestCredentialsErrorsAndProbes(t *testing.T) {
@@ -379,6 +382,103 @@ func TestCanonicalVectors(t *testing.T) {
 	}
 }
 
+func (l *lab) expiry(path, token, reason string) {
+	l.Helper()
+	r := decode[struct{ Code, Reason, Epoch string }](l.T, l.request("GET", path, "", token, 410))
+	if r.Code != "CURSOR_EXPIRED" || r.Reason != reason || (reason == "EPOCH_CHANGED" && r.Epoch != l.Epoch) {
+		l.Fatalf("unexpected expiry: %+v", r)
+	}
+}
+
+func TestSnapshotRetainedDelete(t *testing.T) {
+	l := newLab(t)
+	for _, id := range []string{"C", "B", "A"} {
+		l.inject("edicole", "create", id)
+	}
+	deletion := l.inject("edicole", "delete", "B").Rows[0]
+	base := itemsURL + "?mode=SNAPSHOT"
+	first := l.page(base + "&limit=1")
+	expires := deletion.RecordedAt.Add(l.cfg.Retention)
+	if len(first.Items) != 1 || first.Items[0].ID != "A" || first.Next == nil ||
+		first.PositionExpiresAt == nil || !first.PositionExpiresAt.Equal(expires) {
+		t.Fatal("first page must cover A and report the unread DELETE expiry")
+	}
+	l.command("clock", `{"advance":"P7D"}`)
+	w := l.request("GET", base+"&page="+*first.Next, "", "reader", 200)
+	middle := decode[envelope](t, w)
+	wire := decode[struct{ Items []object }](t, w)
+	if len(wire.Items) != 1 || digest(wire.Items[0]) != deletion.ContentSha256 || deletion.Epoch != first.Epoch {
+		t.Fatal("snapshot DELETE wire content or epoch differs from its ledger row")
+	}
+	if !middle.HasMore || middle.Next == nil || middle.SnapshotAt == nil || first.SnapshotAt == nil || !middle.SnapshotAt.Equal(*first.SnapshotAt) ||
+		len(middle.Items) != 1 || !reflect.DeepEqual(middle.Items[0], deletion.Item) ||
+		middle.Items[0].Op != "DELETE" || middle.Items[0].Properties != nil || middle.PositionExpiresAt != nil {
+		t.Fatal("missing retained DELETE at the inclusive retention boundary")
+	}
+	l.command("clock", `{"advance":"PT1S"}`)
+	l.restart()
+	l.expiry(base+"&page="+*first.Next, "reader", "RETENTION")
+	end := l.page(base + "&page=" + *middle.Next)
+	if len(end.Items) != 1 || end.Items[0].ID != "C" || end.HasMore || end.SnapshotComplete == nil || !*end.SnapshotComplete || end.Resume == nil ||
+		*first.SnapshotID != *end.SnapshotID || !first.SnapshotAt.Equal(end.Resume.SnapshotAt) {
+		t.Fatal("compaction of an already delivered DELETE changed the snapshot")
+	}
+	fresh := l.page(base)
+	if len(fresh.Items) != 2 || fresh.Items[0].ID != "A" || fresh.Items[1].ID != "C" {
+		t.Fatal("fresh snapshot must omit the expired DELETE and preserve both live objects")
+	}
+}
+
+func TestExpectedStateAsOf(t *testing.T) {
+	l := newLab(t)
+	base := "/admin/expected/state?collection=edicole"
+	version := l.page(itemsURL).Version
+	read := func(query string, cut int64) []stateRow {
+		t.Helper()
+		r := decode[struct {
+			AsOf                 *int64
+			Epoch, SchemaVersion string
+			Items                []stateRow
+		}](t, l.request("GET", base+query, "", "admin", 200))
+		if r.AsOf == nil || *r.AsOf != cut || r.Epoch != l.Epoch || r.SchemaVersion != version {
+			t.Fatalf("incorrect state metadata for cut %d", cut)
+		}
+		return r.Items
+	}
+	a := l.inject("edicole", "create", "A").Rows[0]
+	l.command("clock", `{"advance":"PT1M"}`)
+	b := l.inject("edicole", "create", "B").Rows[0]
+	deletion := l.inject("edicole", "delete", "A").Rows[0]
+	l.inject("edicole", "create", "A")
+	if len(read("&asOf=0", 0)) != 0 {
+		t.Fatal("cut zero must precede the first arrival")
+	}
+	l.command("clock", `{"advance":"P6DT23H59M1S"}`)
+	l.restart()
+	l.expiry(base+"&asOf=0", "admin", "RETENTION")
+	atFloor := read("&asOf="+decimalSeq(a.Sequence), a.Sequence)
+	if len(atFloor) != 1 || atFloor[0].ID != "A" || atFloor[0].ContentSha256 != a.ContentSha256 {
+		t.Fatal("checkpoint state unavailable at the compaction floor")
+	}
+	items := read("&asOf="+decimalSeq(b.Sequence), b.Sequence)
+	if len(items) != 2 || items[0].ContentSha256 != a.ContentSha256 || items[1].ContentSha256 != b.ContentSha256 {
+		t.Fatal("historical state must combine checkpoint and retained suffix")
+	}
+	items = read("&asOf="+decimalSeq(deletion.Sequence), deletion.Sequence)
+	if len(items) != 2 || items[0].DeletedAt == nil || !items[0].DeletedAt.Equal(deletion.Item.ChangedAt) || items[0].Revision != deletion.Item.Revision {
+		t.Fatal("reactivation leaked into historical state")
+	}
+	if head := read("", deletion.Sequence+1); len(head) != 2 || head[0].DeletedAt != nil || head[0].Revision != deletion.Item.Revision+1 {
+		t.Fatal("state without asOf must reflect reactivation at head")
+	}
+	for _, bad := range []string{"", "-1", "5", "abc", "1&asOf=2"} {
+		r := decode[struct{ Code string }](t, l.request("GET", base+"&asOf="+bad, "", "admin", 400))
+		if r.Code != "INVALID_POSITION" {
+			t.Fatal("invalid asOf accepted")
+		}
+	}
+}
+
 func decimalSeq(n int64) string {
 	return strconv.FormatInt(n, 10)
 }
@@ -393,7 +493,7 @@ func TestSnapshotMatchesStateWithHiddenCursorDeletes(t *testing.T) {
 		l.inject("cantieri", "create", id)
 	}
 	l.inject("cantieri", "delete", "B")
-	l.inject("cantieri", "update", "C")
+	cut := l.inject("cantieri", "update", "C").NextSince
 	base := "/collections/cantieri/items"
 	changes := l.page(base + "?mode=CURSOR")
 	if len(changes.Items) != 4 || slices.ContainsFunc(changes.Items, func(it item) bool { return it.Op == "DELETE" }) {
@@ -410,7 +510,8 @@ func TestSnapshotMatchesStateWithHiddenCursorDeletes(t *testing.T) {
 		}
 		p = l.page(base + "?page=" + *p.Next)
 	}
-	q := "/admin/expected/state?collection=cantieri&renderAs=" + p.Version + "&limit=1"
+	l.inject("cantieri", "create", "after-snapshot")
+	q := "/admin/expected/state?collection=cantieri&asOf=" + decimalSeq(cut) + "&renderAs=" + p.Version + "&limit=1"
 	after := ""
 	deleted := 0
 	for {
@@ -445,11 +546,18 @@ func TestSnapshotMatchesStateWithHiddenCursorDeletes(t *testing.T) {
 func TestCatalogDigestAndSignedPositions(t *testing.T) {
 	l := newLab(t)
 	cat := decode[struct {
-		SchemaVersion string
-		Collections   []struct{ Collection, SchemaVersion string }
+		SchemaVersion, Epoch string
+		Collections          []struct{ Collection, SchemaVersion, Epoch string }
 	}](t, l.request("GET", "/collections", "", "reader", 200))
+	ep, err := hex.DecodeString(cat.Epoch)
+	if err != nil || len(ep) != 16 || hex.EncodeToString(ep) != cat.Epoch {
+		t.Fatal("invalid catalog epoch")
+	}
 	pairs := [][2]string{}
 	for _, c := range cat.Collections {
+		if c.Epoch != cat.Epoch {
+			t.Fatal("collection epoch differs from catalog")
+		}
 		sc := decode[struct {
 			Fields       []field
 			Geometry     *geometry
@@ -464,6 +572,17 @@ func TestCatalogDigestAndSignedPositions(t *testing.T) {
 	if cat.SchemaVersion != digest(pairs) || pairs[0][0] != "cantieri" {
 		t.Fatal("catalog must hash the sorted pair array")
 	}
+	l.inject("edicole", "create", "A")
+	l.restart()
+	status := decode[struct{ Epoch string }](t, l.request("GET", "/admin/status", "", "admin", 200))
+	if status.Epoch != cat.Epoch || l.expected("since=0").Rows[0].Epoch != cat.Epoch {
+		t.Fatal("journal epoch changed on replay or missing from ledger/status")
+	}
+	for _, query := range []string{"", "?mode=SNAPSHOT", "?mode=WATERMARK&changedSince=" + l.clock.Format(time.RFC3339)} {
+		if l.page(itemsURL+query).Epoch != cat.Epoch {
+			t.Fatal("items epoch differs from catalog")
+		}
+	}
 	p := l.page(itemsURL)
 	raw, tag, _ := strings.Cut(*p.Next, ".")
 	b, _ := b64.DecodeString(raw)
@@ -475,4 +594,10 @@ func TestCatalogDigestAndSignedPositions(t *testing.T) {
 	b, _ = json.Marshal(forged)
 	l.request("GET", itemsURL+"?cursor="+b64.EncodeToString(b)+"."+tag, "", "reader", 400)
 	l.request("GET", itemsURL+"?mode=WATERMARK&cursor="+*p.Next, "", "reader", 400)
+	l.command("reset", "{}")
+	l.restart()
+	if current := l.page(itemsURL).Epoch; current == "" || current == cat.Epoch {
+		t.Fatal("reset did not start a new epoch")
+	}
+	l.expiry(itemsURL+"?cursor="+*p.Next, "reader", "EPOCH_CHANGED")
 }

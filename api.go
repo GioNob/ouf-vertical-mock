@@ -105,6 +105,12 @@ func (s *store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if prob != nil {
 		status = prob.status
 		msg := object{"code": prob.code, "message": http.StatusText(status), "schemaVersion": version}
+		switch prob {
+		case expired:
+			msg["reason"] = "RETENTION"
+		case oldEpoch:
+			msg["reason"], msg["epoch"] = "EPOCH_CHANGED", s.Epoch
+		}
 		if s.Collections[name] != nil {
 			msg["collection"] = name
 		}
@@ -152,11 +158,11 @@ func (s *store) read(w http.ResponseWriter, r *http.Request, path []string, name
 		for _, name := range slices.Sorted(maps.Keys(s.Collections)) {
 			c := s.Collections[name]
 			d := c.Definition
-			rows = append(rows, object{"collection": name, "title": d.Title, "schemaVersion": c.Active, "fieldsSha256": digest(c.Versions[c.Active].Fields),
+			rows = append(rows, object{"collection": name, "epoch": s.Epoch, "title": d.Title, "schemaVersion": c.Active, "fieldsSha256": digest(c.Versions[c.Active].Fields),
 				"deltaModes": d.Delta.Modes, "defaultMode": d.Delta.Default, "deletions": d.Delta.Deletions, "maxLateness": c.Rate.MaxLateness,
 				"cycle": iso(s.Cycle), "retention": iso(s.cfg.Retention), "retainedFrom": c.RetainedFrom})
 		}
-		return object{"schemaVersion": s.catalogVersion(), "collections": rows}, nil
+		return object{"epoch": s.Epoch, "schemaVersion": s.catalogVersion(), "collections": rows}, nil
 	}
 	if len(path) != 3 || s.Collections[name] == nil {
 		return nil, notFound

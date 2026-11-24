@@ -22,6 +22,7 @@ type problem struct {
 var (
 	badPosition = &problem{400, "INVALID_POSITION"}
 	expired     = &problem{410, "CURSOR_EXPIRED"}
+	oldEpoch    = &problem{410, "CURSOR_EXPIRED"}
 	unavailable = &problem{503, "SOURCE_UNAVAILABLE"}
 	unknown     = &problem{404, "UNKNOWN_COLLECTION"}
 	invalid     = &problem{400, "INVALID_COMMAND"}
@@ -76,7 +77,10 @@ func (s *store) decode(raw, name, mode string) (position, *problem) {
 		return p, badPosition
 	}
 	c := s.Collections[name]
-	if p.Epoch != s.Epoch || (p.FirstUnread != 0 && p.FirstUnread <= s.Floor) ||
+	if p.Epoch != s.Epoch {
+		return p, oldEpoch
+	}
+	if (p.FirstUnread != 0 && p.FirstUnread <= s.Floor) ||
 		(p.Tail && p.Low < c.RemovedDelta) || (mode == "SNAPSHOT" && p.High < c.Removed) {
 		return p, expired
 	}
@@ -91,6 +95,7 @@ type resume struct {
 
 type envelope struct {
 	Collection        string     `json:"collection"`
+	Epoch             string     `json:"epoch"`
 	Version           string     `json:"schemaVersion"`
 	FieldsSha256      string     `json:"fieldsSha256"`
 	Mode              string     `json:"mode"`
@@ -99,25 +104,35 @@ type envelope struct {
 	HasMore           bool       `json:"hasMore"`
 	SnapshotComplete  *bool      `json:"snapshotComplete"`
 	SnapshotID        *string    `json:"snapshotId"`
+	SnapshotAt        *time.Time `json:"snapshotAt,omitempty"`
 	Resume            *resume    `json:"resume"`
 	PositionExpiresAt *time.Time `json:"positionExpiresAt"`
+}
+
+// stateAt returns a read-only index at an inclusive arrival sequence.
+func (s *store) stateAt(name string, high int64) map[string]record {
+	c := s.Collections[name]
+	if high == s.head() {
+		return c.live
+	}
+	index := maps.Clone(c.Base)
+	for _, e := range s.history {
+		if e.Seq > high {
+			break
+		}
+		if e.Collection == name {
+			indexEvent(index, e)
+		}
+	}
+	return index
 }
 
 func (s *store) records(p position) []record {
 	c := s.Collections[p.Collection]
 	var rows []record
 	if p.Mode == "SNAPSHOT" {
-		index := maps.Clone(c.Base)
-		for _, e := range s.history {
-			if e.Seq > p.High {
-				break
-			}
-			if e.Collection == p.Collection {
-				indexEvent(index, e)
-			}
-		}
-		for _, e := range index {
-			if e.Op != "DELETE" {
+		for _, e := range s.stateAt(p.Collection, p.High) {
+			if e.Op != "DELETE" || (c.offersEvent(e) && e.Seq > p.Low) {
 				rows = append(rows, e)
 			}
 		}
@@ -170,7 +185,7 @@ func (s *store) items(name string, q url.Values) (envelope, *problem) {
 		mode = c.Definition.Delta.Default
 	}
 	sc := c.Versions[c.Active]
-	out := envelope{Collection: name, Version: c.Active, FieldsSha256: digest(sc.Fields), Mode: mode, Items: []item{}}
+	out := envelope{Collection: name, Epoch: s.Epoch, Version: c.Active, FieldsSha256: digest(sc.Fields), Mode: mode, Items: []item{}}
 	key := "cursor"
 	if mode == "SNAPSHOT" {
 		key = "page"
@@ -243,6 +258,7 @@ func (s *store) items(name string, q url.Values) (envelope, *problem) {
 		complete := !out.HasMore
 		id := digest([]any{s.Epoch, name, p.High, p.At})
 		out.SnapshotID, out.SnapshotComplete = &id, &complete
+		out.SnapshotAt = &p.At
 		if complete {
 			out.Resume = &resume{SnapshotAt: p.At}
 			if slices.Contains(c.Definition.Delta.Modes, "CURSOR") {
@@ -260,11 +276,18 @@ func (s *store) items(name string, q url.Values) (envelope, *problem) {
 	if out.HasMore {
 		last := keyOf(rows[end-1])
 		p.Last = &last
-		if mode != "SNAPSHOT" {
-			first := slices.MinFunc(rows[end:], func(a, b record) int { return cmp.Compare(a.Seq, b.Seq) })
-			p.FirstUnread = first.Seq
-			t := first.RecordedAt.Add(s.cfg.Retention)
-			out.PositionExpiresAt = &t
+		// Compaction preserves live snapshot objects in Base. Unread
+		// tombstones and delta arrivals require a retained journal row.
+		p.FirstUnread = 0
+		for _, e := range rows[end:] {
+			if mode == "SNAPSHOT" && e.Op != "DELETE" {
+				continue
+			}
+			if p.FirstUnread == 0 || e.Seq < p.FirstUnread {
+				p.FirstUnread = e.Seq
+				t := e.RecordedAt.Add(s.cfg.Retention)
+				out.PositionExpiresAt = &t
+			}
 		}
 		next := s.encode(p)
 		out.Next = &next
